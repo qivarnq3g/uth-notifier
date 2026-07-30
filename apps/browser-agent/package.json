@@ -1,0 +1,20 @@
+{
+  "name": "@uth-notifier/browser-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "following": "node --experimental-strip-types src/following.ts",
+    "post": "node --experimental-strip-types src/post.ts",
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit false"
+  },
+  "dependencies": {
+    "playwright-core": "1.61.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
+  }
+}

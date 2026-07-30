@@ -1,0 +1,17 @@
+{
+  "name": "@uth-notifier/edge-worker-tools",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --config wrangler.production.toml",
+    "d1:migrate:local": "wrangler d1 migrations apply uth-notifier-edge --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply uth-notifier-edge --remote"
+  },
+  "devDependencies": {
+    "wrangler": "4.113.0"
+  },
+  "overrides": {
+    "sharp": "0.35.0"
+  }
+}

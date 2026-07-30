@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: uth_notifier_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d uth_notifier_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check public repository boundary
+        shell: pwsh
+        run: ./scripts/check-publication.ps1
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            apps/browser-agent/package-lock.json
+            apps/edge-worker/package-lock.json
+      - name: Install browser agent dependencies
+        working-directory: apps/browser-agent
+        run: npm ci --ignore-scripts
+      - name: Check browser agent types
+        working-directory: apps/browser-agent
+        run: npm run typecheck
+      - name: Audit browser agent dependencies
+        working-directory: apps/browser-agent
+        run: npm audit --audit-level=high
+      - name: Install edge worker tooling
+        working-directory: apps/edge-worker
+        run: npm ci --ignore-scripts
+      - name: Audit edge worker tooling
+        working-directory: apps/edge-worker
+        run: npm audit --audit-level=high
+      - name: Check server deployment configuration
+        run: |
+          docker compose --env-file deploy/server.env.example -f compose.server.yml config --quiet
+          sh -n deploy/server-entrypoint.sh
+          sh -n deploy/backup.sh
+          sh -n deploy/backup-loop.sh
+          sh -n deploy/restore.sh
+          node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('config/facebook-sources.v1.json','utf8'));const ids=x.recommended_sources.map(s=>s.id);if(ids.length!==43||new Set(ids).size!==43)process.exit(1)"
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test Rust workspace
+        run: cargo test --workspace
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --ignore RUSTSEC-2023-0071
+      - name: Build Cloudflare edge worker
+        working-directory: apps/edge-worker
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install worker-build --version 0.8.5 --locked
+          npx wrangler deploy --dry-run --outdir build/dry-run
+      - name: Check classifier regression metrics
+        run: >-
+          cargo run -p uth-agent -- evaluate-classifier
+          --minimum-precision-basis-points 10000
+          --minimum-recall-basis-points 10000
+      - name: Test durable PostgreSQL pipeline
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/uth_notifier_test
+        run: cargo test -p uth-storage --test postgres_storage -- --ignored
+      - name: Build release agent
+        run: cargo build --release -p uth-agent

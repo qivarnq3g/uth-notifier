@@ -1,0 +1,241 @@
+name: uth-notifier
+
+x-agent: &agent
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ${UTH_AGENT_IMAGE:-uth-notifier-agent:local}
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  secrets:
+    - database_url
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - DATABASE_URL="$$(cat /run/secrets/database_url)" uth-agent health --require-healthy >/dev/null
+    interval: 60s
+    timeout: 15s
+    retries: 3
+    start_period: 10m
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-uth_notifier}
+      POSTGRES_USER: ${POSTGRES_USER:-uth_agent}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    mem_limit: 1g
+    cpus: 1.0
+
+  scheduler:
+    <<: *agent
+    environment:
+      FACEBOOK_BROWSER_NETWORK_MODE: ${FACEBOOK_BROWSER_NETWORK_MODE:-prefer_ipv4}
+      CHROME_PATH: ${CHROME_PATH:-/usr/bin/chromium}
+    command:
+      - crawl-scheduled
+      - /run/config/facebook-sources.v1.json
+      - --concurrency
+      - ${CRAWL_CONCURRENCY:-4}
+      - --schedule-interval
+      - ${CRAWL_INTERVAL_SECONDS:-300}
+      - --lease-duration
+      - "600"
+      - --run-retention-days
+      - "30"
+    volumes:
+      - ./config/facebook-sources.v1.json:/run/config/facebook-sources.v1.json:ro
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    shm_size: 512m
+    mem_limit: 2g
+    cpus: 2.0
+
+  classifier:
+    <<: *agent
+    command:
+      - classify
+      - --config
+      - /app/config/classifier-rules.v1.json
+      - --concurrency
+      - "4"
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 256m
+    cpus: 0.5
+
+  notify:
+    <<: *agent
+    command:
+      - notify
+      - --concurrency
+      - "5"
+    secrets:
+      - database_url
+      - telegram_bot_token
+      - telegram_admin_chat_id
+    environment:
+      TELEGRAM_UPDATES_SOURCE: ${TELEGRAM_UPDATES_SOURCE:-polling}
+      TELEGRAM_ADMIN_ONLY: ${TELEGRAM_ADMIN_ONLY:-false}
+      PORTAL_NOTIFICATIONS_ENABLED: ${PORTAL_NOTIFICATIONS_ENABLED:-true}
+      PORTAL_API_BASE: ${PORTAL_API_BASE:-https://portal.ut.edu.vn/api/v1/}
+      DONATE_VIETQR_URL: ${DONATE_VIETQR_URL:-}
+      DONATE_MESSAGE: ${DONATE_MESSAGE:-}
+      DONATE_BANK_ACCOUNT: ${DONATE_BANK_ACCOUNT:-}
+      PAYOS_CLIENT_ID: ${PAYOS_CLIENT_ID:-}
+      PAYOS_API_KEY: ${PAYOS_API_KEY:-}
+      PAYOS_CHECKSUM_KEY: ${PAYOS_CHECKSUM_KEY:-}
+      PAYOS_RETURN_URL: ${PAYOS_RETURN_URL:-}
+      PAYOS_CANCEL_URL: ${PAYOS_CANCEL_URL:-}
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 256m
+    cpus: 0.5
+
+  edge-reconciler:
+    <<: *agent
+    profiles:
+      - edge
+    command:
+      - reconcile-edge
+      - --batch-size
+      - "100"
+      - --lease-duration
+      - "60"
+      - --poll-interval
+      - "2"
+    environment:
+      EDGE_URL: ${EDGE_URL:-https://uth-notifier-edge.example.workers.dev}
+    secrets:
+      - database_url
+      - edge_sync_token
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 128m
+    cpus: 0.25
+
+  backup:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    profiles:
+      - maintenance
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-uth_notifier}
+      POSTGRES_USER: ${POSTGRES_USER:-uth_agent}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    secrets:
+      - postgres_password
+    volumes:
+      - ./backups:/backups
+      - ./deploy/backup.sh:/usr/local/bin/backup:ro
+    entrypoint:
+      - /bin/sh
+      - /usr/local/bin/backup
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  backup-scheduler:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-uth_notifier}
+      POSTGRES_USER: ${POSTGRES_USER:-uth_agent}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETRY_SECONDS: ${BACKUP_RETRY_SECONDS:-300}
+    secrets:
+      - postgres_password
+    volumes:
+      - ./backups:/backups
+      - ./deploy/backup.sh:/usr/local/bin/backup:ro
+      - ./deploy/backup-loop.sh:/usr/local/bin/backup-loop:ro
+    entrypoint:
+      - /bin/sh
+      - /usr/local/bin/backup-loop
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - test -f /backups/.last-success && test -n "$$(find /backups/.last-success -mmin -2880 -print -quit)"
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30m
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  restore:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    profiles:
+      - maintenance
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-uth_notifier}
+      POSTGRES_USER: ${POSTGRES_USER:-uth_agent}
+    secrets:
+      - postgres_password
+    volumes:
+      - ./backups:/backups:ro
+      - ./deploy/restore.sh:/usr/local/bin/restore:ro
+    entrypoint:
+      - /bin/sh
+      - /usr/local/bin/restore
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres_data:
+
+secrets:
+  database_url:
+    file: ./deploy/secrets/database_url
+  postgres_password:
+    file: ./deploy/secrets/postgres_password
+  telegram_admin_chat_id:
+    file: ./deploy/secrets/telegram_admin_chat_id
+  telegram_bot_token:
+    file: ./deploy/secrets/telegram_bot_token
+  edge_sync_token:
+    file: ./deploy/secrets/edge_sync_token

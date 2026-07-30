@@ -1,0 +1,110 @@
+{
+  "schema_version": "classifier-evaluation-dataset.v1",
+  "evaluated_at": "2026-07-19T12:00:00+00:00",
+  "cases": [
+    {
+      "id": "explicit-future-registration",
+      "text": "Mời sinh viên đăng ký tham gia hoạt động được cộng điểm rèn luyện. Hạn đăng ký 2026-07-25 tại Hội trường A.",
+      "outbound_links": ["https://forms.gle/example"],
+      "approved_source": true,
+      "published_at": "2026-07-18T02:00:17+00:00",
+      "expected_decision": "matched_explicit"
+    },
+    {
+      "id": "explicit-drl-without-form",
+      "text": "Mời đăng ký tham gia ngày hội sinh viên được cộng điểm rèn luyện tại cơ sở chính.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-07-18T03:00:00+00:00",
+      "expected_decision": "matched_explicit"
+    },
+    {
+      "id": "registration-form-for-students",
+      "text": "Sinh viên đăng ký tham gia chương trình trực tuyến tại link đăng ký.",
+      "outbound_links": ["https://docs.google.com/forms/d/e/example/viewform"],
+      "approved_source": true,
+      "published_at": "2026-07-18T04:00:00+00:00",
+      "expected_decision": "matched_explicit"
+    },
+    {
+      "id": "future-drl-deadline",
+      "text": "Hoạt động ĐRL dành cho đoàn viên, hạn đăng ký 25/07/2026.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-07-18T05:00:00+00:00",
+      "expected_decision": "matched_explicit"
+    },
+    {
+      "id": "commercial-recruitment",
+      "text": "Tuyển nhân viên bán hàng, đăng ký ngay để nhận khuyến mãi.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-07-18T06:00:00+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "completed-summary",
+      "text": "Nhìn lại chương trình điểm rèn luyện đã diễn ra thành công ngày 18/07/2026.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-07-18T07:00:00+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "past-event",
+      "text": "Chương trình dành cho sinh viên diễn ra ngày 10-07-2026 tại cơ sở A.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-07-18T08:00:00+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "unapproved-source",
+      "text": "Mời sinh viên đăng ký hoạt động điểm rèn luyện trước ngày 25/07/2026.",
+      "outbound_links": ["https://forms.office.com/example"],
+      "approved_source": false,
+      "published_at": "2026-07-18T09:00:00+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "post-too-old",
+      "text": "Mời sinh viên đăng ký tham gia hoạt động điểm rèn luyện.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-04-01T02:00:17+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "ambiguous-student-information",
+      "text": "Thông tin sinh hoạt tháng này dành cho sinh viên.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-07-18T10:00:00+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "location-only",
+      "text": "Chương trình giao lưu tại Hội trường A dành cho sinh viên.",
+      "outbound_links": [],
+      "approved_source": true,
+      "published_at": "2026-07-18T11:00:00+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "unknown-form-without-registration",
+      "text": "Thông tin mới dành cho hội viên được đăng tại cổng nội bộ.",
+      "outbound_links": ["https://example.edu/form"],
+      "approved_source": true,
+      "published_at": "2026-07-18T12:00:00+00:00",
+      "expected_decision": "rejected"
+    },
+    {
+      "id": "online-course-explicit-drl",
+      "text": "Hoạt động dành cho sinh viên được đề xuất cộng điểm rèn luyện. Thời gian từ ngày 29/07/2026 đến ngày 31/07/2026. Hình thức: Tham gia trực tuyến trên hệ thống Courses UTH.",
+      "outbound_links": ["https://courses.ut.edu.vn/course/view.php?id=29965"],
+      "approved_source": true,
+      "published_at": "2026-07-18T13:00:00+00:00",
+      "expected_decision": "matched_explicit"
+    }
+  ]
+}

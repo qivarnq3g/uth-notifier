@@ -1,0 +1,13 @@
+name = "uth-notifier-edge"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-07-22"
+workers_dev = true
+
+[build]
+command = "worker-build --release --no-panic-recovery"
+
+[[d1_databases]]
+binding = "EDGE_DB"
+database_name = "uth-notifier-edge"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

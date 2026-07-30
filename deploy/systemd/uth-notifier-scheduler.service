@@ -1,0 +1,30 @@
+[Unit]
+Description=UTH Notifier crawl scheduler
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=uth-notifier
+Group=uth-notifier
+WorkingDirectory=/opt/uth-notifier/current
+EnvironmentFile=/etc/uth-notifier/runtime.env
+Environment=CHROME_PATH=/usr/bin/chromium
+Environment=FACEBOOK_BROWSER_NETWORK_MODE=prefer_ipv4
+ExecStart=/opt/uth-notifier/current/bin/uth-agent crawl-scheduled /opt/uth-notifier/current/config/facebook-sources.v1.json --concurrency 2 --schedule-interval 300 --active-schedule-interval 120 --idle-schedule-interval 480 --active-unchanged-crawls 3 --idle-after-unchanged-crawls 6 --max-backoff 900 --poll-interval 2 --strategy-circuit-failure-threshold 10 --strategy-circuit-cooldown 900 --strategy-circuit-history-window 86400 --node /usr/bin/node --browser-script /opt/uth-notifier/current/apps/browser-agent/dist/post.js --browser-timeout 60 --browser-retries 1
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+MemoryHigh=1100M
+MemoryMax=1400M
+TasksMax=256
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/uth-notifier
+
+[Install]
+WantedBy=multi-user.target

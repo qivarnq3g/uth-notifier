@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily UTH Notifier PostgreSQL backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=uth-notifier-backup.service
+
+[Install]
+WantedBy=timers.target

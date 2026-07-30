@@ -1,0 +1,30 @@
+{
+  "schema_version": "classifier-rules.v1",
+  "classifier_version": "rules-2026-07-29-online-participation",
+  "max_post_age_days": 60,
+  "explicit_match_score": 7,
+  "registration_form_match_score": 8,
+  "weights": {
+    "explicit_drl": 5,
+    "registration_call": 2,
+    "form_link": 2,
+    "future_event_time": 1,
+    "future_deadline": 2,
+    "location": 1,
+    "target_students": 1,
+    "approved_source": 2,
+    "negative_commercial": -8,
+    "past_event": -8
+  },
+  "keywords": {
+    "explicit_drl": ["điểm rèn luyện", "đrl", "điểm rèn luyện sinh viên"],
+    "registration_call": ["đăng ký tham gia", "đăng ký ngay", "mời đăng ký", "link đăng ký", "hạn đăng ký", "cổng đăng ký", "ghi danh", "tham gia trực tuyến trên hệ thống"],
+    "location": ["địa điểm", "hội trường", "phòng ", "cơ sở ", "trực tuyến", "online"],
+    "target_students": ["sinh viên", "đoàn viên", "hội viên", "tân sinh viên"],
+    "negative_commercial": ["tuyển dụng", "tuyển nhân viên", "mua ngay", "giảm giá", "khuyến mãi", "bán hàng", "chốt đơn"],
+    "completed_summary": ["tổng kết chương trình", "đã diễn ra thành công", "nhìn lại chương trình", "khép lại chương trình"],
+    "deadline_context": ["hạn đăng ký", "hạn chót", "hạn cuối", "deadline", "đăng ký trước", "trước ngày", "chậm nhất", "thời hạn"],
+    "event_context": ["diễn ra", "tổ chức", "thời gian", "bắt đầu", "chương trình"]
+  },
+  "form_hosts": ["forms.gle", "docs.google.com", "form.office.com", "forms.office.com", "tally.so", "airtable.com", "typeform.com", "jotform.com"]
+}

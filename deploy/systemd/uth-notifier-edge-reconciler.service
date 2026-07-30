@@ -1,0 +1,28 @@
+[Unit]
+Description=UTH Notifier edge event reconciler
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=uth-notifier
+Group=uth-notifier
+WorkingDirectory=/opt/uth-notifier/current
+EnvironmentFile=/etc/uth-notifier/runtime.env
+ExecStart=/opt/uth-notifier/current/bin/uth-agent reconcile-edge --batch-size 50 --lease-duration 60 --poll-interval 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+MemoryHigh=64M
+MemoryMax=96M
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/uth-notifier
+
+[Install]
+WantedBy=multi-user.target

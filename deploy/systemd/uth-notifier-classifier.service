@@ -1,0 +1,28 @@
+[Unit]
+Description=UTH Notifier classifier
+After=network-online.target postgresql.service uth-notifier-scheduler.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=uth-notifier
+Group=uth-notifier
+WorkingDirectory=/opt/uth-notifier/current
+EnvironmentFile=/etc/uth-notifier/runtime.env
+ExecStart=/opt/uth-notifier/current/bin/uth-agent classify --config /opt/uth-notifier/current/config/classifier-rules.v1.json --concurrency 1 --poll-interval 5
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+MemoryHigh=96M
+MemoryMax=128M
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/uth-notifier
+
+[Install]
+WantedBy=multi-user.target

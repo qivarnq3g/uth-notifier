@@ -90,6 +90,6 @@ jobs:
       - name: Test durable PostgreSQL pipeline
         env:
           TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/uth_notifier_test
-        run: cargo test -p uth-storage --test postgres_storage -- --ignored
+        run: cargo test -p uth-storage --test postgres_storage -- --ignored --test-threads=1
       - name: Build release agent
         run: cargo build --release -p uth-agent

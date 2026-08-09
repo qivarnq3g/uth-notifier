@@ -171,6 +171,34 @@ chỉ cho một delivery upload khi chưa có `telegram_file_id`; sau khi Telegr
 poll xuất hiện trong trường `portal.error` của `notification-worker-cycle.v1`; lỗi
 tải hoặc gửi đi theo retry hữu hạn của delivery.
 
+### Poll Portal thích ứng
+
+Đây là hành vi production từ release `20260809-portal-adaptive-polling-v2`.
+Mục tiêu là giảm request từ IP đầu ra của máy chủ mà vẫn giữ độ trễ ngắn khi Portal đăng
+nhiều thông báo liên tiếp:
+
+- Ở trạng thái ổn định, poll mỗi 300 giây với jitter hữu hạn và chỉ yêu cầu mục mới nhất
+  bằng `page=1&size=1`.
+- Khi ID mới nhất lớn hơn cursor, tải các trang có kích thước nhỏ theo thứ tự giới hạn cho
+  đến khi gặp cursor, xử lý mọi ID còn thiếu theo thứ tự tăng dần, rồi poll mỗi 60 giây trong
+  15 phút. Mỗi ID chỉ được lấy chi tiết và tệp khi chưa được lưu.
+- Sau 15 phút không có ID mới, tự trở lại chu kỳ 300 giây. Trạng thái burst và thời điểm poll
+  kế tiếp phải quan sát được và an toàn qua restart; PostgreSQL cursor vẫn là mốc đầy đủ.
+- Với HTTP `403`, không retry tức thời: mở circuit 6 giờ và báo quản trị viên. Với `429`, tôn
+  trọng `Retry-After`; nếu header thiếu hoặc không hợp lệ thì nghỉ tối thiểu 30 phút. Với `5xx`
+  hoặc lỗi mạng, chỉ retry hữu hạn bằng exponential backoff có jitter rồi nghỉ 15 phút.
+- Dùng `ETag` hoặc `Last-Modified` khi endpoint thực sự cung cấp và xử lý đúng conditional
+  request; đây chỉ là tối ưu băng thông, không được dùng thay cursor hoặc tính là giảm số request.
+- Log phải ghi chế độ `steady`/`burst`/`cooldown`, HTTP outcome, lý do cooldown, thời điểm poll
+  kế tiếp và số ID mới, nhưng không ghi payload riêng tư hoặc địa chỉ hạ tầng.
+- Test phải chứng minh không bỏ sót nhiều ID giữa hai poll, restart không phát lại lịch sử,
+  `403`/`429` không tạo retry burst, và rollback về scheduler cố định không làm hỏng cursor.
+
+IPv6 không phải cơ chế giảm tải hoặc né chặn. Không đổi họ địa chỉ, proxy, exit node hay egress
+để vượt `403`/`429`; phải giảm request và tôn trọng cooldown. Tại lần kiểm tra production ngày
+2026-08-09, máy chủ có default IPv6 route nhưng DNS công khai của `portal.ut.edu.vn` không có
+bản ghi AAAA, nên request Portal vẫn dùng IPv4.
+
 Tương tác Telegram và callback payOS lỗi được thử lại hữu hạn trong PostgreSQL.
 Sau ba lần, sự kiện được chuyển sang trạng thái lỗi cách ly để một payload hỏng
 không thể chặn các tin nhắn phía sau; trạng thái này xuất hiện trong health admin.

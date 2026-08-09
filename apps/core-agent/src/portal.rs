@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Utc};
 use regex::Regex;
 use reqwest::header::{
-    ACCEPT, ACCEPT_LANGUAGE, CONTENT_DISPOSITION, CONTENT_TYPE, REFERER, UPGRADE_INSECURE_REQUESTS,
-    USER_AGENT,
+    ACCEPT, ACCEPT_LANGUAGE, CONTENT_DISPOSITION, CONTENT_TYPE, REFERER, RETRY_AFTER,
+    UPGRADE_INSECURE_REQUESTS, USER_AGENT,
 };
 use serde::Deserialize;
 use url::Url;
@@ -37,6 +38,36 @@ pub struct PortalAttachment {
     pub file_name: String,
     pub content_type: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalFailureKind {
+    Forbidden,
+    RateLimited,
+    Server,
+    Network,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortalFailure {
+    pub kind: PortalFailureKind,
+    pub status: Option<u16>,
+    pub retry_after_seconds: Option<u64>,
+}
+
+#[derive(Debug)]
+struct PortalHttpError {
+    status: u16,
+    retry_after_seconds: Option<u64>,
+}
+
+impl fmt::Display for PortalHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Portal returned HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for PortalHttpError {}
 
 #[derive(Clone)]
 pub struct PortalClient {
@@ -309,7 +340,13 @@ impl PortalClient {
         for attempt in 1..=PORTAL_REQUEST_ATTEMPTS {
             match self.get_json_once(url.clone()).await {
                 Ok(value) => return Ok(value),
-                Err(error) if attempt < PORTAL_REQUEST_ATTEMPTS => {
+                Err(error)
+                    if attempt < PORTAL_REQUEST_ATTEMPTS
+                        && matches!(
+                            classify_portal_error(&error).kind,
+                            PortalFailureKind::Server | PortalFailureKind::Network
+                        ) =>
+                {
                     last_error = Some(error);
                     tokio::time::sleep(PORTAL_RETRY_BASE_DELAY * u32::try_from(attempt)?).await;
                 }
@@ -325,9 +362,19 @@ impl PortalClient {
             .get(url)
             .send()
             .await
-            .context("Portal request failed")?
-            .error_for_status()
-            .context("Portal returned an error status")?;
+            .context("Portal request failed")?;
+        if !response.status().is_success() {
+            let retry_after_seconds = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            return Err(PortalHttpError {
+                status: response.status().as_u16(),
+                retry_after_seconds,
+            }
+            .into());
+        }
         if response
             .content_length()
             .is_some_and(|length| length > PORTAL_JSON_RESPONSE_LIMIT as u64)
@@ -387,6 +434,41 @@ impl PortalClient {
             bail!("Portal article returned a Cloudflare challenge")
         }
         Ok(html)
+    }
+}
+
+pub fn classify_portal_error(error: &anyhow::Error) -> PortalFailure {
+    for cause in error.chain() {
+        if let Some(http) = cause.downcast_ref::<PortalHttpError>() {
+            let kind = match http.status {
+                403 => PortalFailureKind::Forbidden,
+                429 => PortalFailureKind::RateLimited,
+                500..=599 => PortalFailureKind::Server,
+                _ => PortalFailureKind::Other,
+            };
+            return PortalFailure {
+                kind,
+                status: Some(http.status),
+                retry_after_seconds: http.retry_after_seconds,
+            };
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>()
+            && (request.is_timeout()
+                || request.is_connect()
+                || request.is_request()
+                || request.is_body())
+        {
+            return PortalFailure {
+                kind: PortalFailureKind::Network,
+                status: request.status().map(|status| status.as_u16()),
+                retry_after_seconds: None,
+            };
+        }
+    }
+    PortalFailure {
+        kind: PortalFailureKind::Other,
+        status: None,
+        retry_after_seconds: None,
     }
 }
 
@@ -598,8 +680,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        PortalClient, PortalNotice, attachment_file_name, extract_first_daotao_pdf_link,
-        extract_first_https_link, render_portal_notification, validate_attachment_url,
+        PortalClient, PortalFailureKind, PortalNotice, attachment_file_name, classify_portal_error,
+        extract_first_daotao_pdf_link, extract_first_https_link, render_portal_notification,
+        validate_attachment_url,
     };
 
     #[tokio::test]
@@ -627,6 +710,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn does_not_retry_rate_limit_and_preserves_retry_after() {
+        let (base_url, server) = mock_server_with_headers(
+            429,
+            "Retry-After: 120\r\n",
+            r#"{"success":false,"body":{}}"#,
+        )
+        .await;
+        let client = PortalClient::new(
+            Url::parse(&base_url).unwrap(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+
+        let error = client.latest_portal_id(1).await.unwrap_err();
+        let failure = classify_portal_error(&error);
+        assert_eq!(failure.kind, PortalFailureKind::RateLimited);
+        assert_eq!(failure.status, Some(429));
+        assert_eq!(failure.retry_after_seconds, Some(120));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
     async fn returns_recent_portal_ids_in_descending_order_without_duplicates() {
         let (base_url, server) = mock_server(vec![(
             200,
@@ -647,6 +755,36 @@ mod tests {
         );
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("GET /notification?page=1&size=20"));
+    }
+
+    #[tokio::test]
+    async fn catches_up_every_id_across_bounded_pages_in_ascending_order() {
+        let (base_url, server) = mock_server(vec![
+            (
+                200,
+                r#"{"success":true,"body":{"content":[{"id":105},{"id":104}],"totalPages":2}}"#,
+            ),
+            (
+                200,
+                r#"{"success":true,"body":{"content":[{"id":103},{"id":102}],"totalPages":2}}"#,
+            ),
+        ])
+        .await;
+        let client = PortalClient::new(
+            Url::parse(&base_url).unwrap(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.notice_ids_after(103, 2, 2).await.unwrap(),
+            vec![104, 105]
+        );
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /notification?page=1&size=2"));
+        assert!(requests[1].starts_with("GET /notification?page=2&size=2"));
     }
 
     #[tokio::test]
@@ -801,6 +939,37 @@ mod tests {
                 requests.push(String::from_utf8_lossy(&request).into_owned());
             }
             requests
+        });
+        (format!("http://{address}/"), task)
+    }
+
+    async fn mock_server_with_headers(
+        status: u16,
+        headers: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4_096];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} Error\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            vec![String::from_utf8_lossy(&request).into_owned()]
         });
         (format!("http://{address}/"), task)
     }

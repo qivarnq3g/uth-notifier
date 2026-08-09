@@ -19,13 +19,14 @@ use uth_storage::{
     DonationIntentPaymentLink, DonationPayment, FailureDisposition, LatestPostRecord,
     ManualReviewAction, ManualReviewNotification, ManualReviewRecord, NotificationContent,
     NotificationPlanOutcome, OperationalAlertKind, OperationalHealth, PortalNoticeHistoryRecord,
-    PortalNoticePlanOutcome, PortalNoticeRecord, USER_STOP_REASON, UserFeedbackHistoryRecord,
+    PortalNoticePlanOutcome, PortalNoticeRecord, PortalPollState, USER_STOP_REASON,
+    UserFeedbackHistoryRecord,
 };
 
 use crate::payos::PayOsClient;
 use crate::portal::{
-    PortalAttachment, PortalClient, PortalNotice, TELEGRAM_DOCUMENT_LIMIT,
-    render_portal_notification,
+    PortalAttachment, PortalClient, PortalFailureKind, PortalNotice, TELEGRAM_DOCUMENT_LIMIT,
+    classify_portal_error, render_portal_notification,
 };
 
 const DONATION_AMOUNT_INPUT_TTL_SECONDS: i64 = 600;
@@ -199,10 +200,28 @@ pub struct NotifyArgs {
     )]
     portal_api_base: url::Url,
 
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 300)]
     portal_poll_interval: u64,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 60)]
+    portal_burst_interval: u64,
+
+    #[arg(long, default_value_t = 900)]
+    portal_burst_duration: u64,
+
+    #[arg(long, default_value_t = 21_600)]
+    portal_forbidden_cooldown: u64,
+
+    #[arg(long, default_value_t = 1_800)]
+    portal_rate_limit_cooldown: u64,
+
+    #[arg(long, default_value_t = 900)]
+    portal_failure_cooldown: u64,
+
+    #[arg(long, default_value_t = 10)]
+    portal_jitter_percent: u32,
+
+    #[arg(long, default_value_t = 20)]
     portal_page_size: usize,
 
     #[arg(long, default_value_t = 20)]
@@ -338,6 +357,9 @@ struct DigestCycleReport {
 #[derive(Debug, Default, Serialize)]
 struct PortalCycleReport {
     checked: bool,
+    mode: String,
+    next_poll_at: Option<String>,
+    cooldown_reason: Option<String>,
     baseline_initialized: bool,
     history_archived: usize,
     notices_found: usize,
@@ -346,7 +368,35 @@ struct PortalCycleReport {
     deliveries_created: u64,
     attachment_discovery_errors: usize,
     attachment_discovery_error: Option<String>,
+    failure_kind: Option<String>,
+    http_status: Option<u16>,
+    retry_after_seconds: Option<u64>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PortalPollConfig {
+    steady_interval: u64,
+    burst_interval: u64,
+    burst_duration: u64,
+    forbidden_cooldown: u64,
+    rate_limit_cooldown: u64,
+    failure_cooldown: u64,
+    jitter_percent: u32,
+}
+
+impl From<&NotifyArgs> for PortalPollConfig {
+    fn from(args: &NotifyArgs) -> Self {
+        Self {
+            steady_interval: args.portal_poll_interval,
+            burst_interval: args.portal_burst_interval,
+            burst_duration: args.portal_burst_duration,
+            forbidden_cooldown: args.portal_forbidden_cooldown,
+            rate_limit_cooldown: args.portal_rate_limit_cooldown,
+            failure_cooldown: args.portal_failure_cooldown,
+            jitter_percent: args.portal_jitter_percent,
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -480,7 +530,15 @@ pub async fn run(args: NotifyArgs) -> Result<()> {
     )?;
     let mut next_retention_at = Instant::now();
     let mut next_health_alert_at = Instant::now();
-    let mut next_portal_poll_at = Instant::now();
+    let mut portal_poll_state = store.portal_poll_state().await?.unwrap_or(PortalPollState {
+        mode: "steady".to_owned(),
+        next_poll_at: Utc::now(),
+        burst_until: None,
+        cooldown_reason: None,
+        last_polled_at: None,
+        last_poll_outcome: None,
+        last_http_status: None,
+    });
     let mut shutdown_signals = ShutdownSignals::new()?;
     loop {
         let acquired_lease = tokio::select! {
@@ -513,13 +571,25 @@ pub async fn run(args: NotifyArgs) -> Result<()> {
         let apply_retention = now >= next_retention_at;
         let iteration = async {
             run_payos_payment_cycle(&store, &telegram).await?;
-            let portal_report = if args.portal_notifications_enabled && now >= next_portal_poll_at {
-                next_portal_poll_at = now
-                    .checked_add(Duration::from_secs(args.portal_poll_interval))
-                    .context("Portal poll interval exceeds monotonic clock range")?;
-                run_portal_cycle(&store, &portal, &args).await
+            let portal_now = Utc::now();
+            let portal_report = if args.portal_notifications_enabled
+                && portal_now >= portal_poll_state.next_poll_at
+            {
+                let mut report = run_portal_cycle(&store, &portal, &args).await;
+                let next_state = next_portal_poll_state(
+                    &portal_poll_state,
+                    &report,
+                    portal_now,
+                    PortalPollConfig::from(&args),
+                )?;
+                if store.portal_notice_cursor().await?.is_some() {
+                    store.update_portal_poll_state(&next_state).await?;
+                }
+                portal_poll_state = next_state;
+                apply_portal_poll_state(&mut report, &portal_poll_state);
+                report
             } else {
-                PortalCycleReport::default()
+                portal_cycle_report(&portal_poll_state)
             };
             let interaction = run_interaction_cycle(
                 &store,
@@ -796,6 +866,121 @@ async fn run_digest_cycle(
     Ok(report)
 }
 
+fn portal_failure_name(kind: PortalFailureKind) -> &'static str {
+    match kind {
+        PortalFailureKind::Forbidden => "forbidden",
+        PortalFailureKind::RateLimited => "rate_limited",
+        PortalFailureKind::Server => "server",
+        PortalFailureKind::Network => "network",
+        PortalFailureKind::Other => "other",
+    }
+}
+
+fn portal_cycle_report(state: &PortalPollState) -> PortalCycleReport {
+    let mut report = PortalCycleReport::default();
+    apply_portal_poll_state(&mut report, state);
+    report
+}
+
+fn apply_portal_poll_state(report: &mut PortalCycleReport, state: &PortalPollState) {
+    report.mode.clone_from(&state.mode);
+    report.next_poll_at = Some(state.next_poll_at.to_rfc3339());
+    report.cooldown_reason.clone_from(&state.cooldown_reason);
+}
+
+fn next_portal_poll_state(
+    current: &PortalPollState,
+    report: &PortalCycleReport,
+    polled_at: DateTime<Utc>,
+    config: PortalPollConfig,
+) -> Result<PortalPollState> {
+    let status = report.http_status.map(i32::from);
+    if report.error.is_some() {
+        let failure = report.failure_kind.as_deref().unwrap_or("other");
+        let delay = match failure {
+            "forbidden" => config.forbidden_cooldown,
+            "rate_limited" => report
+                .retry_after_seconds
+                .unwrap_or(config.rate_limit_cooldown)
+                .max(1),
+            _ => config.failure_cooldown,
+        };
+        return Ok(PortalPollState {
+            mode: "cooldown".to_owned(),
+            next_poll_at: add_portal_delay(polled_at, delay)?,
+            burst_until: None,
+            cooldown_reason: Some(failure.to_owned()),
+            last_polled_at: Some(polled_at),
+            last_poll_outcome: Some(format!("error_{failure}")),
+            last_http_status: status,
+        });
+    }
+
+    let seed = polled_at.timestamp_millis().unsigned_abs();
+    if report.notices_found > 0 {
+        let burst_until = add_portal_delay(polled_at, config.burst_duration)?;
+        return Ok(PortalPollState {
+            mode: "burst".to_owned(),
+            next_poll_at: add_portal_delay(
+                polled_at,
+                jittered_portal_delay(config.burst_interval, config.jitter_percent, seed),
+            )?,
+            burst_until: Some(burst_until),
+            cooldown_reason: None,
+            last_polled_at: Some(polled_at),
+            last_poll_outcome: Some("new_notices".to_owned()),
+            last_http_status: status,
+        });
+    }
+
+    if current.mode == "burst" && current.burst_until.is_some_and(|until| until > polled_at) {
+        return Ok(PortalPollState {
+            mode: "burst".to_owned(),
+            next_poll_at: add_portal_delay(
+                polled_at,
+                jittered_portal_delay(config.burst_interval, config.jitter_percent, seed),
+            )?,
+            burst_until: current.burst_until,
+            cooldown_reason: None,
+            last_polled_at: Some(polled_at),
+            last_poll_outcome: Some("unchanged".to_owned()),
+            last_http_status: status,
+        });
+    }
+
+    Ok(PortalPollState {
+        mode: "steady".to_owned(),
+        next_poll_at: add_portal_delay(
+            polled_at,
+            jittered_portal_delay(config.steady_interval, config.jitter_percent, seed),
+        )?,
+        burst_until: None,
+        cooldown_reason: None,
+        last_polled_at: Some(polled_at),
+        last_poll_outcome: Some("unchanged".to_owned()),
+        last_http_status: status,
+    })
+}
+
+fn jittered_portal_delay(base_seconds: u64, percent: u32, seed: u64) -> u64 {
+    let window = base_seconds.saturating_mul(u64::from(percent)) / 100;
+    if window == 0 {
+        return base_seconds;
+    }
+    let width = window.saturating_mul(2).saturating_add(1);
+    base_seconds
+        .saturating_sub(window)
+        .saturating_add(seed % width)
+        .max(1)
+}
+
+fn add_portal_delay(timestamp: DateTime<Utc>, seconds: u64) -> Result<DateTime<Utc>> {
+    let seconds = i64::try_from(seconds).context("Portal poll delay exceeds timestamp range")?;
+    timestamp
+        .checked_add_signed(ChronoDuration::seconds(seconds))
+        .context("Portal poll timestamp exceeds supported range")
+}
+
 async fn run_portal_cycle(
     store: &CrawlStore,
     portal: &PortalClient,
@@ -809,12 +994,16 @@ async fn run_portal_cycle(
         report.history_archived =
             archive_recent_portal_history_if_empty(store, portal, &mut report).await?;
         let Some(cursor) = store.portal_notice_cursor().await? else {
-            let latest_portal_id = portal.latest_portal_id(args.portal_page_size).await?;
+            let latest_portal_id = portal.latest_portal_id(1).await?;
             report.baseline_initialized = store
                 .initialize_portal_notice_cursor(latest_portal_id)
                 .await?;
             return Result::<()>::Ok(());
         };
+        let latest_portal_id = portal.latest_portal_id(1).await?;
+        if latest_portal_id <= cursor {
+            return Ok(());
+        }
         let notice_ids = portal
             .notice_ids_after(cursor, args.portal_page_size, args.portal_max_pages)
             .await?;
@@ -842,8 +1031,15 @@ async fn run_portal_cycle(
         Ok(())
     }
     .await;
-    if let Err(error) = result {
-        report.error = Some(error.to_string().chars().take(1_000).collect());
+    match result {
+        Ok(()) => report.http_status = Some(200),
+        Err(error) => {
+            let failure = classify_portal_error(&error);
+            report.failure_kind = Some(portal_failure_name(failure.kind).to_owned());
+            report.http_status = failure.status;
+            report.retry_after_seconds = failure.retry_after_seconds;
+            report.error = Some(error.to_string().chars().take(1_000).collect());
+        }
     }
     report
 }
@@ -3638,6 +3834,18 @@ fn validate_args(args: &NotifyArgs) -> Result<()> {
         || args.health_alert_grace_seconds == 0
         || args.health_alert_interval == 0
         || args.portal_poll_interval == 0
+        || args.portal_poll_interval > 86_400
+        || args.portal_burst_interval == 0
+        || args.portal_burst_interval > args.portal_poll_interval
+        || args.portal_burst_duration < args.portal_burst_interval
+        || args.portal_burst_duration > 86_400
+        || args.portal_forbidden_cooldown == 0
+        || args.portal_forbidden_cooldown > 2_592_000
+        || args.portal_rate_limit_cooldown == 0
+        || args.portal_rate_limit_cooldown > 2_592_000
+        || args.portal_failure_cooldown == 0
+        || args.portal_failure_cooldown > 2_592_000
+        || args.portal_jitter_percent > 25
         || !(1..=100).contains(&args.portal_page_size)
         || args.portal_max_pages == 0
         || args.portal_request_timeout == 0
@@ -3895,14 +4103,15 @@ fn render_operational_alert(kind: OperationalAlertKind, health: &OperationalHeal
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use uth_storage::{
         CrawlAttemptHistoryRecord, CrawlHistoryDetail, CrawlHistoryRecord, OperationalHealth,
-        PortalNoticeHistoryRecord, SourceRecord, UserFeedbackHistoryRecord,
+        PortalNoticeHistoryRecord, PortalPollState, SourceRecord, UserFeedbackHistoryRecord,
     };
 
     use super::{
-        DonationConfig, InteractionCommand, SUPPORT_GROUP_INVITATION, display_bank,
+        DonationConfig, InteractionCommand, PortalCycleReport, PortalPollConfig,
+        SUPPORT_GROUP_INVITATION, display_bank, next_portal_poll_state,
         normalize_facebook_page_url, parse_donation_amount, parse_interaction_command,
         render_crawl_history_detail, render_crawl_history_page, render_donation, render_help,
         render_operational_alert, render_operational_health, render_payment_account,
@@ -3916,6 +4125,121 @@ mod tests {
         assert_eq!(retry_delay_seconds(1, 30, 900), 30);
         assert_eq!(retry_delay_seconds(2, 30, 900), 60);
         assert_eq!(retry_delay_seconds(30, 30, 900), 900);
+    }
+
+    #[test]
+    fn portal_polling_enters_and_exits_a_bounded_burst() {
+        let polled_at = Utc.with_ymd_and_hms(2026, 8, 9, 10, 0, 0).unwrap();
+        let config = portal_poll_config();
+        let steady = portal_poll_state("steady", polled_at, None);
+        let found = PortalCycleReport {
+            checked: true,
+            notices_found: 2,
+            http_status: Some(200),
+            ..PortalCycleReport::default()
+        };
+
+        let burst = next_portal_poll_state(&steady, &found, polled_at, config).unwrap();
+        assert_eq!(burst.mode, "burst");
+        assert_eq!(burst.next_poll_at, polled_at + ChronoDuration::seconds(60));
+        assert_eq!(
+            burst.burst_until,
+            Some(polled_at + ChronoDuration::seconds(900))
+        );
+
+        let unchanged = PortalCycleReport {
+            checked: true,
+            http_status: Some(200),
+            ..PortalCycleReport::default()
+        };
+        let within_burst = polled_at + ChronoDuration::seconds(60);
+        let continued = next_portal_poll_state(&burst, &unchanged, within_burst, config).unwrap();
+        assert_eq!(continued.mode, "burst");
+        assert_eq!(
+            continued.next_poll_at,
+            within_burst + ChronoDuration::seconds(60)
+        );
+
+        let after_burst = polled_at + ChronoDuration::seconds(901);
+        let steady_again =
+            next_portal_poll_state(&continued, &unchanged, after_burst, config).unwrap();
+        assert_eq!(steady_again.mode, "steady");
+        assert_eq!(
+            steady_again.next_poll_at,
+            after_burst + ChronoDuration::seconds(300)
+        );
+    }
+
+    #[test]
+    fn portal_polling_cools_down_without_jitter_after_access_denial() {
+        let polled_at = Utc.with_ymd_and_hms(2026, 8, 9, 10, 0, 0).unwrap();
+        let state = portal_poll_state("steady", polled_at, None);
+        let forbidden = PortalCycleReport {
+            checked: true,
+            failure_kind: Some("forbidden".to_owned()),
+            http_status: Some(403),
+            error: Some("Portal returned HTTP 403".to_owned()),
+            ..PortalCycleReport::default()
+        };
+
+        let cooldown =
+            next_portal_poll_state(&state, &forbidden, polled_at, portal_poll_config()).unwrap();
+        assert_eq!(cooldown.mode, "cooldown");
+        assert_eq!(cooldown.cooldown_reason.as_deref(), Some("forbidden"));
+        assert_eq!(
+            cooldown.next_poll_at,
+            polled_at + ChronoDuration::seconds(21_600)
+        );
+        assert_eq!(cooldown.last_http_status, Some(403));
+    }
+
+    #[test]
+    fn portal_polling_honors_rate_limit_retry_after() {
+        let polled_at = Utc.with_ymd_and_hms(2026, 8, 9, 10, 0, 0).unwrap();
+        let state = portal_poll_state("steady", polled_at, None);
+        let rate_limited = PortalCycleReport {
+            checked: true,
+            failure_kind: Some("rate_limited".to_owned()),
+            http_status: Some(429),
+            retry_after_seconds: Some(120),
+            error: Some("Portal returned HTTP 429".to_owned()),
+            ..PortalCycleReport::default()
+        };
+
+        let cooldown =
+            next_portal_poll_state(&state, &rate_limited, polled_at, portal_poll_config()).unwrap();
+        assert_eq!(
+            cooldown.next_poll_at,
+            polled_at + ChronoDuration::seconds(120)
+        );
+    }
+
+    fn portal_poll_config() -> PortalPollConfig {
+        PortalPollConfig {
+            steady_interval: 300,
+            burst_interval: 60,
+            burst_duration: 900,
+            forbidden_cooldown: 21_600,
+            rate_limit_cooldown: 1_800,
+            failure_cooldown: 900,
+            jitter_percent: 0,
+        }
+    }
+
+    fn portal_poll_state(
+        mode: &str,
+        next_poll_at: chrono::DateTime<Utc>,
+        burst_until: Option<chrono::DateTime<Utc>>,
+    ) -> PortalPollState {
+        PortalPollState {
+            mode: mode.to_owned(),
+            next_poll_at,
+            burst_until,
+            cooldown_reason: None,
+            last_polled_at: None,
+            last_poll_outcome: None,
+            last_http_status: None,
+        }
     }
 
     #[test]

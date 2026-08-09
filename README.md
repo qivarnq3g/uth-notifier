@@ -32,7 +32,8 @@ tài nguyên trong ràng buộc chi phí bắt buộc bằng 0 đồng.
 > Notifier lưu trạng thái health trong PostgreSQL, chủ động báo admin khi lỗi nghiêm
 > trọng, khi degraded kéo dài và khi hệ thống duy trì phục hồi đủ ngưỡng mà không gửi
 > lặp sau restart.
-> Notifier kiểm tra API công khai của Portal UTH mỗi 60 giây. Lần chạy đầu chỉ
+> Notifier kiểm tra API công khai của Portal UTH theo chu kỳ thích ứng: mặc định khoảng
+> 5 phút có jitter và chuyển sang khoảng 1 phút trong 15 phút sau khi thấy ID mới. Lần chạy đầu chỉ
 > ghi nhận thông báo mới nhất làm baseline; từ đó mỗi ID mới tạo một campaign bắt
 > buộc cho cả người đang nhận tin hoạt động lẫn người đã dùng `/stop`. Nếu Portal
 > công bố tệp, bot tải tối đa 50 MiB từ đúng endpoint chính thức, upload một lần

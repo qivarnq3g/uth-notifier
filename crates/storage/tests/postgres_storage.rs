@@ -8,7 +8,7 @@ use uth_domain::{
 use uth_storage::{
     CrawlStore, DeliveryFailureClass, DonationIntentPaymentLink, DonationPayment,
     FailureDisposition, ManualReviewAction, ManualReviewNotification, NotificationContent,
-    OperationalAlertKind, PortalNoticeRecord, SourceSeed, USER_STOP_REASON,
+    OperationalAlertKind, PortalNoticeRecord, PortalPollState, SourceSeed, USER_STOP_REASON,
 };
 
 #[tokio::test]
@@ -1200,8 +1200,39 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
             .unwrap()
     );
     assert!(store.initialize_portal_notice_cursor(100).await.unwrap());
-
+    let cursor_updated_at_before = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        "SELECT updated_at FROM portal_notice_state WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let displayed_at = Utc.with_ymd_and_hms(2026, 7, 27, 3, 0, 0).unwrap();
+    let next_poll_at = Utc.with_ymd_and_hms(2026, 7, 27, 3, 5, 0).unwrap();
+    let burst_until = Utc.with_ymd_and_hms(2026, 7, 27, 3, 20, 0).unwrap();
+    store
+        .update_portal_poll_state(&PortalPollState {
+            mode: "burst".to_owned(),
+            next_poll_at,
+            burst_until: Some(burst_until),
+            cooldown_reason: None,
+            last_polled_at: Some(displayed_at),
+            last_poll_outcome: Some("new_notices".to_owned()),
+            last_http_status: Some(200),
+        })
+        .await
+        .unwrap();
+    let poll_state = store.portal_poll_state().await.unwrap().unwrap();
+    assert_eq!(poll_state.mode, "burst");
+    assert_eq!(poll_state.next_poll_at, next_poll_at);
+    assert_eq!(poll_state.burst_until, Some(burst_until));
+    let cursor_updated_at_after = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        "SELECT updated_at FROM portal_notice_state WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cursor_updated_at_after, cursor_updated_at_before);
+
     let outcome = store
         .plan_portal_notice(
             &PortalNoticeRecord {

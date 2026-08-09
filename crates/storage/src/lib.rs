@@ -362,6 +362,17 @@ pub struct PortalNoticeHistoryRecord {
     pub discovered_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalPollState {
+    pub mode: String,
+    pub next_poll_at: DateTime<Utc>,
+    pub burst_until: Option<DateTime<Utc>>,
+    pub cooldown_reason: Option<String>,
+    pub last_polled_at: Option<DateTime<Utc>>,
+    pub last_poll_outcome: Option<String>,
+    pub last_http_status: Option<i32>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PortalNoticePlanOutcome {
     pub notice_created: bool,
@@ -3150,6 +3161,69 @@ impl CrawlStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    pub async fn portal_poll_state(&self) -> Result<Option<PortalPollState>> {
+        let row = sqlx::query(
+            "SELECT poll_mode, next_poll_at, burst_until, cooldown_reason, last_polled_at, \
+                    last_poll_outcome, last_http_status \
+             FROM portal_notice_state WHERE singleton = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| PortalPollState {
+            mode: row.get("poll_mode"),
+            next_poll_at: row.get("next_poll_at"),
+            burst_until: row.get("burst_until"),
+            cooldown_reason: row.get("cooldown_reason"),
+            last_polled_at: row.get("last_polled_at"),
+            last_poll_outcome: row.get("last_poll_outcome"),
+            last_http_status: row.get("last_http_status"),
+        }))
+    }
+
+    pub async fn update_portal_poll_state(&self, state: &PortalPollState) -> Result<()> {
+        let valid_shape = match state.mode.as_str() {
+            "steady" => state.burst_until.is_none() && state.cooldown_reason.is_none(),
+            "burst" => state.burst_until.is_some() && state.cooldown_reason.is_none(),
+            "cooldown" => state.burst_until.is_none() && state.cooldown_reason.is_some(),
+            _ => false,
+        };
+        if !valid_shape
+            || state
+                .cooldown_reason
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 100)
+            || state
+                .last_poll_outcome
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.chars().count() > 100)
+            || state
+                .last_http_status
+                .is_some_and(|status| !(100..=599).contains(&status))
+        {
+            bail!("Portal poll state is invalid");
+        }
+        let rows = sqlx::query(
+            "UPDATE portal_notice_state SET poll_mode = $1, next_poll_at = $2, \
+                    burst_until = $3, cooldown_reason = $4, last_polled_at = $5, \
+                    last_poll_outcome = $6, last_http_status = $7 \
+             WHERE singleton = TRUE",
+        )
+        .bind(&state.mode)
+        .bind(state.next_poll_at)
+        .bind(state.burst_until)
+        .bind(&state.cooldown_reason)
+        .bind(state.last_polled_at)
+        .bind(&state.last_poll_outcome)
+        .bind(state.last_http_status)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows != 1 {
+            bail!("Portal notice cursor is not initialized");
+        }
+        Ok(())
     }
 
     pub async fn initialize_portal_notice_cursor(&self, latest_portal_id: i64) -> Result<bool> {

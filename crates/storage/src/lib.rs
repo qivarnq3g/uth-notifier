@@ -11,6 +11,7 @@ use uth_domain::{
     BrowserAttemptMetadata, CLASSIFICATION_SCHEMA_VERSION, ClassificationDecision,
     ClassificationResult, CrawlReport, EDGE_EVENT_SCHEMA_VERSION, EdgeEvent, FacebookPost,
     MediaItem, POST_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, TELEGRAM_MESSAGE_LIMIT,
+    TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT,
 };
 
 pub const USER_STOP_REASON: &str = "Người dùng tắt bằng lệnh Telegram";
@@ -79,6 +80,7 @@ pub struct ClaimedSource {
     pub schedule_interval_seconds: u64,
     pub unchanged_crawl_count: u32,
     pub initial_crawl: bool,
+    pub reconciliation_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +500,9 @@ fn build_digest_batch(
     }
     if message_text.chars().count() > TELEGRAM_MESSAGE_LIMIT {
         bail!("digest builder exceeded the Telegram message limit");
+    }
+    if message_text.len() > TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT {
+        bail!("digest builder exceeded the UTF-8 storage limit");
     }
 
     let selected_entries = &entries[..selected_count];
@@ -1712,7 +1717,19 @@ impl CrawlStore {
              FROM due WHERE source.id = due.id \
              RETURNING source.id, source.source_key, source.name, source.url, \
                        source.failure_count, source.schedule_interval_seconds, \
-                       source.unchanged_crawl_count, due.initial_crawl",
+                       source.unchanged_crawl_count, due.initial_crawl, EXISTS ( \
+                           SELECT 1 FROM crawler_runs AS degraded \
+                           WHERE degraded.source_id = source.id \
+                             AND degraded.health <> 'healthy' \
+                             AND degraded.fetched_at >= CURRENT_TIMESTAMP - INTERVAL '6 hours' \
+                             AND NOT EXISTS ( \
+                                 SELECT 1 FROM crawler_runs AS recovered \
+                                 WHERE recovered.source_id = source.id \
+                                   AND recovered.health = 'healthy' \
+                                   AND recovered.post_count >= 2 \
+                                   AND recovered.fetched_at > degraded.fetched_at \
+                             ) \
+                       ) AS reconciliation_required",
         )
         .bind(limit)
         .bind(owner)
@@ -1735,6 +1752,7 @@ impl CrawlStore {
                     schedule_interval_seconds,
                     unchanged_crawl_count,
                     initial_crawl: row.get("initial_crawl"),
+                    reconciliation_required: row.get("reconciliation_required"),
                 })
             })
             .collect()
@@ -1798,17 +1816,17 @@ impl CrawlStore {
         let run_id = insert_run(&mut transaction, source.id, report, fetched_at).await?;
         insert_attempts(&mut transaction, run_id, report).await?;
         let mut outcome = PersistOutcome::default();
-        if report.health == "healthy" {
-            if report.posts.is_empty() {
-                bail!("healthy crawl report must contain at least one post");
-            }
+        if report.health == "healthy" && report.posts.is_empty() {
+            bail!("healthy crawl report must contain at least one post");
+        }
+        if !report.posts.is_empty() {
             let historical_cutoff = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
                 "SELECT min(fetched_at) FROM crawler_runs WHERE source_id = $1 AND health = 'healthy'",
             )
             .bind(source.id)
             .fetch_one(&mut *transaction)
             .await?
-            .context("healthy source has no baseline crawl time")?;
+            .unwrap_or(fetched_at);
             for post in &report.posts {
                 if post.source_id != report.source_id {
                     bail!("post source ID does not match crawl report source ID");
@@ -4843,7 +4861,10 @@ mod tests {
         adaptive_next_schedule, build_digest_batch, operational_alert_kind, same_post_content,
         source_alerts_are_systemic,
     };
-    use uth_domain::{FacebookPost, MediaItem, POST_SCHEMA_VERSION, TELEGRAM_MESSAGE_LIMIT};
+    use uth_domain::{
+        FacebookPost, MediaItem, POST_SCHEMA_VERSION, TELEGRAM_MESSAGE_LIMIT,
+        TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT,
+    };
 
     fn source(unchanged_crawl_count: u32, initial_crawl: bool) -> ClaimedSource {
         ClaimedSource {
@@ -4855,6 +4876,7 @@ mod tests {
             schedule_interval_seconds: 300,
             unchanged_crawl_count,
             initial_crawl,
+            reconciliation_required: false,
         }
     }
 
@@ -5013,6 +5035,7 @@ mod tests {
         assert!(plan.message_text.contains("Các tin còn lại"));
         assert!(plan.message_text.chars().count() <= TELEGRAM_MESSAGE_LIMIT);
         assert!(plan.message_text.len() > TELEGRAM_MESSAGE_LIMIT);
+        assert!(plan.message_text.len() <= TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT);
     }
 
     #[test]

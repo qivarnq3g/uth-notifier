@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   appendGraphqlSnapshot,
+  chromiumCrashReportingArgs,
   chromiumNetworkArgs,
   inspectGraphqlBody,
   isFacebookLoginRoute,
@@ -13,6 +14,13 @@ import {
 } from "../src/post.ts";
 
 const sourceUrl = "https://www.facebook.com/uth.example/";
+
+test("headless Chromium crash reporting remains disabled", () => {
+  assert.deepEqual(chromiumCrashReportingArgs, [
+    "--disable-breakpad",
+    "--disable-crash-reporter",
+  ]);
+});
 
 test("browser network mode defaults safely and rejects unknown values", () => {
   assert.equal(parseBrowserNetworkMode(undefined), "system");
@@ -193,7 +201,12 @@ test("chọn bài mới nhất đúng owner từ GraphQL dạng nhiều dòng", 
   assert.equal(inspection.posts[0].publishedAt, "2025-07-02T00:00:00.000Z");
   const normalized = JSON.parse(
     /data-uth-source="graphql-normalized">([^<]+)<\/script>/.exec(
-      appendGraphqlSnapshot("<html></html>", inspection.payloads, inspection.posts),
+      appendGraphqlSnapshot(
+        "<html></html>",
+        inspection.payloads,
+        inspection.posts,
+        sourceUrl,
+      ),
     )[1],
   );
   assert.equal(normalized.posts.length, 2);
@@ -260,6 +273,7 @@ test("ghi trường chuẩn hóa mà Rust parser sử dụng vào snapshot", () 
     "<html><body></body></html>",
     inspection.payloads,
     inspection.posts,
+    sourceUrl,
   );
   const match = html.match(
     /data-uth-source="graphql-normalized">([^<]+)<\/script>/,
@@ -273,4 +287,37 @@ test("ghi trường chuẩn hóa mà Rust parser sử dụng vào snapshot", () 
     message: { text: "Thông báo được chuyển qua contract nội bộ." },
     url: "https://www.facebook.com/uth.example/posts/pfbidContract",
   });
+});
+
+test("chuẩn hóa GraphQL sang numeric permalink khi source identity đã xác minh", () => {
+  const numericSourceUrl =
+    "https://www.facebook.com/people/uth-example/61566022178074/";
+  const raw = JSON.stringify({
+    data: {
+      node: story({
+        id: "122100000000000007",
+        owner: "uth-example",
+        ownerId: "61566022178074",
+        timestamp: 1_751_414_400,
+        text: "Thông báo có numeric post ID và owner đã xác minh.",
+        url: "https://www.facebook.com/uth.example/posts/pfbidRotatingLocator",
+      }),
+    },
+  });
+  const inspection = inspectGraphqlBody(raw, numericSourceUrl);
+
+  const html = appendGraphqlSnapshot(
+    "<html></html>",
+    inspection.payloads,
+    inspection.posts,
+    numericSourceUrl,
+  );
+  const normalized = JSON.parse(
+    /data-uth-source="graphql-normalized">([^<]+)<\/script>/.exec(html)[1],
+  );
+
+  assert.equal(
+    normalized.posts[0].url,
+    "https://www.facebook.com/61566022178074/posts/122100000000000007",
+  );
 });

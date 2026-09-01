@@ -240,6 +240,18 @@ pub struct NotifyArgs {
     once: bool,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct ReviewSendArgs {
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+    database_url: String,
+
+    #[arg(long, env = "TELEGRAM_ADMIN_CHAT_ID")]
+    admin_chat_id: i64,
+
+    #[arg(help = "Pending manual-review classification ID")]
+    classification_id: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TelegramUpdatesSource {
     Polling,
@@ -682,6 +694,35 @@ pub async fn run(args: NotifyArgs) -> Result<()> {
             () = tokio::time::sleep(Duration::from_secs(args.poll_interval)) => {}
         }
     }
+}
+
+pub async fn run_review_send(args: ReviewSendArgs) -> Result<()> {
+    if args.admin_chat_id == 0 || args.classification_id <= 0 {
+        bail!("admin chat ID and classification ID must be valid");
+    }
+    let store = CrawlStore::connect(&args.database_url, 5).await?;
+    store.migrate().await?;
+    let review = store
+        .manual_review(args.classification_id)
+        .await?
+        .context("classification is not pending manual review")?;
+    let notification = render_notification(&review.post);
+    let post_url = delivery_post_url(&review.post);
+    let outcome = store
+        .resolve_manual_review(
+            args.classification_id,
+            args.admin_chat_id,
+            args.admin_chat_id,
+            ManualReviewAction::Send,
+            Some("approved through the authenticated production operations path"),
+            Some(ManualReviewNotification {
+                message_text: &notification,
+                post_url: &post_url,
+            }),
+        )
+        .await?;
+    println!("{}", serde_json::to_string(&outcome)?);
+    Ok(())
 }
 
 async fn configure_bot_commands(

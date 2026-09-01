@@ -4,7 +4,9 @@ use chrono::{DateTime, FixedOffset, NaiveDate};
 use reqwest::{StatusCode, redirect};
 use serde::{Deserialize, Serialize};
 use url::Url;
-use uth_domain::{ClassificationResult, FacebookPost, TELEGRAM_MESSAGE_LIMIT};
+use uth_domain::{
+    ClassificationResult, FacebookPost, TELEGRAM_MESSAGE_LIMIT, TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT,
+};
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const TELEGRAM_RESPONSE_LIMIT: u64 = 65_536;
@@ -797,7 +799,9 @@ pub fn render_notification(post: &FacebookPost) -> String {
         .saturating_add(footer.chars().count());
     let body_limit = TELEGRAM_MESSAGE_LIMIT.saturating_sub(reserved);
     let body = truncate_chars(post.text.trim(), body_limit);
-    format!("{header}{body}{footer}")
+    let message = format!("{header}{body}{footer}");
+    debug_assert!(message.len() <= TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT);
+    message
 }
 
 pub fn delivery_post_url(post: &FacebookPost) -> String {
@@ -1586,7 +1590,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use uth_domain::{FacebookPost, POST_SCHEMA_VERSION};
+    use uth_domain::{FacebookPost, POST_SCHEMA_VERSION, TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT};
 
     use super::{
         TelegramClient, TelegramConfigurationOutcome, TelegramSendOutcome, TelegramUpdatesOutcome,
@@ -2061,6 +2065,7 @@ mod tests {
         let message = render_notification(&post);
 
         assert!(message.chars().count() <= 4_096);
+        assert!(message.len() <= TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT);
         assert!(message.contains(&post.canonical_url));
         assert!(message.contains("09:00 ngày 19/07/2026"));
         assert!(!message.contains("2026-07-19T02:00:17+00:00"));

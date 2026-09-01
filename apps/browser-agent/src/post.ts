@@ -7,6 +7,11 @@ import { chromium, type Response } from "playwright-core";
 const searchUserAgent =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
+export const chromiumCrashReportingArgs = [
+  "--disable-breakpad",
+  "--disable-crash-reporter",
+] as const;
+
 type BrowserSnapshot = {
   schema_version: "facebook-browser-snapshot.v1";
   source_url: string;
@@ -106,6 +111,16 @@ function pageIdentity(sourceUrl: string): string {
     return segments[2];
   }
   return segments[0] ?? "";
+}
+
+function verifiedNumericPageIdentity(sourceUrl: string): string | null {
+  const parsed = new URL(sourceUrl);
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments[0] === "people" && /^\d+$/.test(segments[2] ?? "")) {
+    return segments[2] ?? null;
+  }
+  const id = parsed.searchParams.get("id");
+  return id && /^\d+$/.test(id) ? id : null;
 }
 
 function sourceIdentities(sourceUrl: string): Set<string> {
@@ -643,7 +658,9 @@ export function appendGraphqlSnapshot(
   html: string,
   payloads: string[],
   posts: GraphqlPost[],
+  sourceUrl: string,
 ): string {
+  const numericPageIdentity = verifiedNumericPageIdentity(sourceUrl);
   const normalizedPosts = posts
     .filter(
       (post) =>
@@ -655,7 +672,10 @@ export function appendGraphqlSnapshot(
       post_id: post.externalPostId,
       creation_time: Math.floor(Date.parse(post.publishedAt as string) / 1_000),
       message: { text: post.text },
-      url: post.url,
+      url:
+        numericPageIdentity && /^\d{8,}$/.test(post.externalPostId as string)
+          ? `https://www.facebook.com/${numericPageIdentity}/posts/${post.externalPostId}`
+          : post.url,
     }));
   const normalizedPayload =
     normalizedPosts.length > 0
@@ -754,8 +774,8 @@ class GraphqlCapture {
     );
   }
 
-  appendPayloads(html: string): string {
-    return appendGraphqlSnapshot(html, this.payloads, this.posts);
+  appendPayloads(html: string, sourceUrl: string): string {
+    return appendGraphqlSnapshot(html, this.payloads, this.posts, sourceUrl);
   }
 }
 
@@ -1079,6 +1099,7 @@ async function captureSnapshot(
     executablePath,
     headless: true,
     args: [
+      ...chromiumCrashReportingArgs,
       "--disable-background-networking",
       "--disable-component-update",
       "--disable-default-apps",
@@ -1195,7 +1216,7 @@ async function captureSnapshot(
       login_overlay_detected: loginOverlayDetected,
       login_overlay_dismissed: loginOverlayDismissed,
       login_route_detected: isFacebookLoginRoute(sourceFinalUrl),
-      html: graphqlCapture.appendPayloads(sourceHtml),
+      html: graphqlCapture.appendPayloads(sourceHtml, sourceUrl),
     };
     await context.close();
     return snapshot;

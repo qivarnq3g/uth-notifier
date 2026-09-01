@@ -8,6 +8,7 @@ pub const REPORT_SCHEMA_VERSION: &str = "facebook-crawl-report.v1";
 pub const CLASSIFICATION_SCHEMA_VERSION: &str = "classification.v1";
 pub const EDGE_EVENT_SCHEMA_VERSION: &str = "edge-event.v1";
 pub const TELEGRAM_MESSAGE_LIMIT: usize = 4_096;
+pub const TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT: usize = TELEGRAM_MESSAGE_LIMIT * 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MediaItem {

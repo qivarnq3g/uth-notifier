@@ -109,6 +109,8 @@ enum Command {
     FinalizeClassifierReview(classifier_review::FinalizeClassifierReviewArgs),
     #[command(about = "Plan and send Telegram notifications")]
     Notify(Box<notification_worker::NotifyArgs>),
+    #[command(about = "Approve one pending manual review and queue notifications")]
+    ReviewSend(notification_worker::ReviewSendArgs),
     #[command(about = "Manage Telegram notification recipients")]
     Subscriber(notification_worker::SubscriberArgs),
     #[command(about = "Review Facebook Page suggestions from Telegram users")]
@@ -457,6 +459,7 @@ async fn main() -> Result<()> {
         Command::PrepareClassifierReview(args) => classifier_review::run(args),
         Command::FinalizeClassifierReview(args) => classifier_review::finalize(args),
         Command::Notify(args) => notification_worker::run(*args).await,
+        Command::ReviewSend(args) => notification_worker::run_review_send(args).await,
         Command::Subscriber(args) => notification_worker::run_subscriber(args).await,
         Command::Suggestion(args) => notification_worker::run_suggestion(args).await,
         Command::Health(args) => operational_health::run(args).await,
@@ -663,10 +666,13 @@ async fn run_scheduled_source(
             skipped: Vec::new(),
         },
     };
-    let selected_settings = CrawlSettings {
+    let mut selected_settings = CrawlSettings {
         strategies: strategy_selection.enabled.clone(),
         ..settings.clone()
     };
+    if source.failure_count > 0 || source.reconciliation_required {
+        selected_settings.minimum_yield = selected_settings.minimum_yield.max(2);
+    }
     let (crawl_result, crawl_presentation) = match facebook_crawl_target(&source.key, &source.url) {
         Ok(target) => {
             let crawl_presentation = target.presentation_kind.to_owned();
@@ -1171,21 +1177,55 @@ async fn crawl_facebook_target(
     {
         let fallback_report = crawl_source(fallback_url, settings).await?;
         let fallback_report = finalize_facebook_crawl_report(fallback_report, target)?;
-        report = merge_presentation_reports(report, fallback_report);
+        report = merge_presentation_reports(report, fallback_report, settings.minimum_yield);
     }
     Ok(report)
 }
 
-fn merge_presentation_reports(mut primary: CrawlReport, mut fallback: CrawlReport) -> CrawlReport {
+fn merge_presentation_reports(
+    mut primary: CrawlReport,
+    mut fallback: CrawlReport,
+    minimum_yield: usize,
+) -> CrawlReport {
     let fallback_is_better = report_quality(&fallback) > report_quality(&primary);
     let mut attempts = std::mem::take(&mut primary.attempts);
     attempts.append(&mut fallback.attempts);
+    let alternate_posts = if fallback_is_better {
+        std::mem::take(&mut primary.posts)
+    } else {
+        std::mem::take(&mut fallback.posts)
+    };
     let mut selected = if fallback_is_better {
         fallback
     } else {
         primary
     };
+    for post in alternate_posts {
+        if let Some(existing) = selected.posts.iter_mut().find(|existing| {
+            existing.external_post_id == post.external_post_id
+                || existing.canonical_url == post.canonical_url
+                || (existing.published_at == post.published_at
+                    && existing.content_hash == post.content_hash)
+        }) {
+            if post.text.len() > existing.text.len() {
+                *existing = post;
+            }
+        } else {
+            selected.posts.push(post);
+        }
+    }
+    selected
+        .posts
+        .sort_by(|left, right| right.published_at.cmp(&left.published_at));
     selected.attempts = attempts;
+    selected.post_count = selected.posts.len();
+    if !selected.posts.is_empty() {
+        selected.health = if selected.post_count >= minimum_yield {
+            "healthy".to_owned()
+        } else {
+            "degraded".to_owned()
+        };
+    }
     selected
 }
 
@@ -1311,7 +1351,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use uth_domain::{Attempt, CrawlReport, ParseStats};
+    use uth_domain::{Attempt, CrawlReport, FacebookPost, POST_SCHEMA_VERSION, ParseStats};
 
     use super::{
         facebook_crawl_target, facebook_source_key, finalize_facebook_crawl_report,
@@ -1408,13 +1448,54 @@ mod tests {
         let primary = test_crawl_report("degraded", "primary");
         let fallback = test_crawl_report("healthy", "fallback");
 
-        let merged = merge_presentation_reports(primary, fallback);
+        let merged = merge_presentation_reports(primary, fallback, 1);
 
         assert_eq!(merged.health, "healthy");
         assert_eq!(merged.selected_strategy.as_deref(), Some("fallback"));
         assert_eq!(merged.attempts.len(), 2);
         assert_eq!(merged.attempts[0].strategy, "primary");
         assert_eq!(merged.attempts[1].strategy, "fallback");
+    }
+
+    #[test]
+    fn presentation_fallback_combines_distinct_sparse_windows() {
+        let mut primary = test_crawl_report("degraded", "primary");
+        primary
+            .posts
+            .push(test_facebook_post("101", "2026-09-01T03:00:00Z"));
+        primary.post_count = 1;
+        let mut fallback = test_crawl_report("degraded", "fallback");
+        fallback
+            .posts
+            .push(test_facebook_post("100", "2026-09-01T02:00:00Z"));
+        fallback.post_count = 1;
+
+        let merged = merge_presentation_reports(primary, fallback, 2);
+
+        assert_eq!(merged.health, "healthy");
+        assert_eq!(merged.post_count, 2);
+        assert_eq!(merged.posts[0].external_post_id, "101");
+        assert_eq!(merged.posts[1].external_post_id, "100");
+        assert_eq!(merged.attempts.len(), 2);
+    }
+
+    fn test_facebook_post(external_post_id: &str, published_at: &str) -> FacebookPost {
+        FacebookPost {
+            schema_version: POST_SCHEMA_VERSION.to_owned(),
+            source_id: "facebook:100064352813128".to_owned(),
+            platform: "facebook".to_owned(),
+            external_post_id: external_post_id.to_owned(),
+            canonical_url: format!(
+                "https://www.facebook.com/100064352813128/posts/{external_post_id}"
+            ),
+            published_at: published_at.to_owned(),
+            text: format!("Post {external_post_id}"),
+            media: Vec::new(),
+            outbound_links: Vec::new(),
+            content_hash: format!("hash-{external_post_id}"),
+            crawl_strategy: "browser_playwright".to_owned(),
+            fetched_at: "2026-09-01T04:00:00Z".to_owned(),
+        }
     }
 
     fn test_crawl_report(health: &str, strategy: &str) -> CrawlReport {

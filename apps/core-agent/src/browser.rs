@@ -1,15 +1,29 @@
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use uth_crawler::facebook::{PostHint, classify_outcome, extract_posts_with_hint};
 use uth_domain::{Attempt, BrowserAttemptMetadata, CrawlReport, FacebookPost, ParseStats};
 
 const BROWSER_STRATEGY: &str = "browser_playwright";
 pub const BROWSER_HISTORY_TARGET: usize = 20;
+
+#[derive(Debug)]
+struct BrowserProcessOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum BrowserProcessError {
+    Execution(String),
+    TimedOut(Option<String>),
+}
 
 #[derive(Debug, Deserialize)]
 struct BrowserSnapshot {
@@ -79,6 +93,143 @@ fn browser_attempt_metadata(snapshot: &BrowserSnapshot) -> Option<BrowserAttempt
     })
 }
 
+async fn read_browser_pipe<R>(mut pipe: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+async fn collect_browser_pipe(
+    pipe_name: &str,
+    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, String> {
+    task.await
+        .map_err(|error| format!("browser {pipe_name} reader task failed: {error}"))?
+        .map_err(|error| format!("browser {pipe_name} read failed: {error}"))
+}
+
+#[cfg(unix)]
+fn configure_browser_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_browser_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_browser_process_group(process_group_id: Option<u32>) -> Result<(), String> {
+    let process_group_id = process_group_id
+        .ok_or_else(|| "browser process ID is unavailable".to_owned())
+        .and_then(|value| {
+            i32::try_from(value).map_err(|_| "browser process ID exceeds i32".to_owned())
+        })?;
+    let result = unsafe { libc::kill(-process_group_id, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("browser process-group kill failed: {error}"))
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_browser_process_group(_process_group_id: Option<u32>) -> Result<(), String> {
+    Ok(())
+}
+
+async fn terminate_browser_process(
+    child: &mut Child,
+    process_group_id: Option<u32>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(error) = kill_browser_process_group(process_group_id) {
+        errors.push(error);
+    }
+    if let Err(error) = child.kill().await
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        errors.push(format!("browser direct-child kill failed: {error}"));
+    }
+    if let Err(error) = child.wait().await {
+        errors.push(format!("browser direct-child reap failed: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn run_browser_process(
+    command: &mut Command,
+    browser_timeout: Duration,
+) -> Result<BrowserProcessOutput, BrowserProcessError> {
+    configure_browser_process_group(command);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| BrowserProcessError::Execution(error.to_string()))?;
+    let process_group_id = child.id();
+    let stdout = child.stdout.take().ok_or_else(|| {
+        BrowserProcessError::Execution("browser stdout pipe is unavailable".to_owned())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        BrowserProcessError::Execution("browser stderr pipe is unavailable".to_owned())
+    })?;
+    let stdout_task = tokio::spawn(read_browser_pipe(stdout));
+    let stderr_task = tokio::spawn(read_browser_pipe(stderr));
+
+    let status = match timeout(browser_timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let cleanup_error = terminate_browser_process(&mut child, process_group_id)
+                .await
+                .err();
+            let _ = collect_browser_pipe("stdout", stdout_task).await;
+            let _ = collect_browser_pipe("stderr", stderr_task).await;
+            let detail = cleanup_error
+                .map(|cleanup| format!("{error}; {cleanup}"))
+                .unwrap_or_else(|| error.to_string());
+            return Err(BrowserProcessError::Execution(detail));
+        }
+        Err(_) => {
+            let mut cleanup_errors = Vec::new();
+            if let Err(error) = terminate_browser_process(&mut child, process_group_id).await {
+                cleanup_errors.push(error);
+            }
+            if let Err(error) = collect_browser_pipe("stdout", stdout_task).await {
+                cleanup_errors.push(error);
+            }
+            if let Err(error) = collect_browser_pipe("stderr", stderr_task).await {
+                cleanup_errors.push(error);
+            }
+            return Err(BrowserProcessError::TimedOut(
+                (!cleanup_errors.is_empty()).then(|| cleanup_errors.join("; ")),
+            ));
+        }
+    };
+    let stdout = collect_browser_pipe("stdout", stdout_task)
+        .await
+        .map_err(BrowserProcessError::Execution)?;
+    let stderr = collect_browser_pipe("stderr", stderr_task)
+        .await
+        .map_err(BrowserProcessError::Execution)?;
+    Ok(BrowserProcessOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 pub async fn apply_browser_fallback(
     report: &mut CrawlReport,
     node: &Path,
@@ -99,19 +250,23 @@ pub async fn apply_browser_fallback(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let output = match timeout(browser_timeout, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            push_failure(report, started.elapsed().as_millis(), error.to_string());
+    let output = match run_browser_process(&mut command, browser_timeout).await {
+        Ok(output) => output,
+        Err(BrowserProcessError::Execution(error)) => {
+            push_failure(report, started.elapsed().as_millis(), error);
             return;
         }
-        Err(_) => {
+        Err(BrowserProcessError::TimedOut(cleanup_error)) => {
+            let cleanup_detail = cleanup_error
+                .map(|error| format!("; browser cleanup failed: {error}"))
+                .unwrap_or_default();
             push_failure(
                 report,
                 started.elapsed().as_millis(),
                 format!(
-                    "browser fallback exceeded {} seconds",
-                    browser_timeout.as_secs()
+                    "browser fallback exceeded {} seconds{}",
+                    browser_timeout.as_secs(),
+                    cleanup_detail
                 ),
             );
             return;
@@ -269,6 +424,11 @@ fn push_failure(report: &mut CrawlReport, latency_ms: u128, error: String) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     fn post(id: &str, published_at: &str) -> FacebookPost {
         FacebookPost {
             schema_version: "facebook-post.v1".to_owned(),
@@ -299,5 +459,76 @@ mod tests {
         assert_eq!(existing.len(), 2);
         assert_eq!(existing[0].external_post_id, "new");
         assert_eq!(existing[1].external_post_id, "same");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_timeout_terminates_background_descendants() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let task_directory = std::env::temp_dir().join(format!(
+            "uth-agent-browser-process-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&task_directory).unwrap();
+        let descendant_pid_path = task_directory.join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & echo $! > \"$1\"; wait")
+            .arg("sh")
+            .arg(&descendant_pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let result = run_browser_process(&mut command, Duration::from_millis(500)).await;
+
+        assert!(matches!(result, Err(BrowserProcessError::TimedOut(_))));
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let descendant_stat_path = Path::new("/proc")
+            .join(descendant_pid.to_string())
+            .join("stat");
+        for _ in 0..40 {
+            let state = fs::read_to_string(&descendant_stat_path)
+                .ok()
+                .and_then(|stat| stat.split_whitespace().nth(2).map(str::to_owned));
+            if state.is_none() || state.as_deref() == Some("Z") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let state = fs::read_to_string(descendant_stat_path)
+            .ok()
+            .and_then(|stat| stat.split_whitespace().nth(2).map(str::to_owned));
+        assert!(state.is_none() || state.as_deref() == Some("Z"));
+        fs::remove_file(descendant_pid_path).unwrap();
+        fs::remove_dir(task_directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_process_collects_stdout_and_stderr() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf stdout; printf stderr >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = run_browser_process(&mut command, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
     }
 }

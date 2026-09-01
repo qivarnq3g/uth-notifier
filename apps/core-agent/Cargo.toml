@@ -25,3 +25,6 @@ uth-crawler = { path = "../../crates/crawler" }
 uth-delivery = { path = "../../crates/delivery" }
 uth-domain = { path = "../../crates/domain" }
 uth-storage = { path = "../../crates/storage" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -28,13 +28,15 @@ Production evidence on 2026-09-01 showed 1,159 browser timeouts, 1,141 abandoned
 
 If the timeout expires, the supervisor will send `SIGKILL` to the negative process-group ID, call the direct child's kill operation as a fallback, and then wait for that child. It will await the pipe readers after termination so no reader task or pipe remains live. `ESRCH` is treated as an already-exited process, while other cleanup failures are included in the recorded browser attempt error.
 
+Each browser invocation receives a unique `uth-browser-run-*` temporary directory through `TMPDIR`, `TMP`, and `TEMP`. The supervisor explicitly closes that directory after termination and reports a cleanup failure in the attempt. Because a descendant can be forked concurrently with the first process-group signal, the timeout path repeats bounded `SIGKILL` sweeps for 250 milliseconds after reaping Node before removing the directory.
+
 On non-Unix platforms the supervisor will kill and wait for the direct child. Production is Linux, so the process-group guarantee applies to the deployed runtime while Windows remains build-compatible.
 
-The implementation will use `libc` only for Unix process-group signaling and Tokio `io-util` for concurrent pipe reads. No external `kill`, shell, or paid dependency is introduced.
+The implementation uses `libc` only for Unix process-group signaling, Tokio `io-util` for concurrent pipe reads, and `tempfile` for exact per-run directory ownership and cleanup. No external `kill`, shell, or paid service is introduced.
 
 ## Testing
 
-A Unix regression test will spawn a shell that creates a long-lived background child. The supervisor must time out, return the existing timeout classification, and leave neither the shell nor its background child alive. A success-path test will verify exit status plus stdout and stderr collection.
+A Unix regression test spawns a shell that creates a long-lived background child and residue inside the assigned browser temporary directory. The supervisor must time out, preserve the existing timeout classification, stop the background child, and remove the exact temporary directory. A success-path test verifies exit status plus stdout and stderr collection.
 
 The Linux builder will run the focused browser tests and the full workspace tests. The release build will use the pinned Docker `rust-builder` stage and `--locked`.
 
@@ -45,6 +47,8 @@ Build the Linux amd64 binary locally, verify its SHA-256 before and after upload
 The controlled stop uses the existing `KillMode=control-group`, which terminates old Chromium descendants. Once the unit fully stops, systemd tears down the scheduler's private temporary namespace and removes the abandoned Playwright directories. No manual recursive deletion is required unless post-stop verification proves systemd did not remove them.
 
 After cutover, verify the scheduler and all four units are active, `NRestarts` is stable, no lease remains for the previous scheduler owner, Chromium wait channels no longer show cgroup memory throttling, swap pressure falls, new crawler-run records appear, and Playwright temporary directory counts do not grow across bounded timeout canaries. Keep the prior release as the rollback target.
+
+Production v3 verification on 2026-09-01 forced a one-second browser timeout. The attempt remained `network_error` with the exact configured timeout message, root-owned Chromium stayed at zero, and root-owned profile, artifact, and `uth-browser-run-*` counts did not increase. Six subsequent scheduled runs included four healthy and two degraded outcomes, with zero cleanup errors, zero old-owner leases, 45 MiB swap in use, and temporary directory counts bounded by the two active browser slots.
 
 ## Rollback
 

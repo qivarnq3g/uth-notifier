@@ -4,9 +4,11 @@
 
 **Goal:** Prevent browser timeouts from leaking Chromium descendants and Playwright temporary directories, then recover and verify production.
 
-**Architecture:** The Rust browser adapter will supervise Node in a dedicated Unix process group, drain output pipes concurrently, kill and reap the group on timeout, and preserve a direct-child fallback elsewhere. Production recovery uses a unique release and controlled scheduler restart so systemd can clear the existing private temporary namespace.
+**Architecture:** The Rust browser adapter supervises Node in a dedicated Unix process group, drains output pipes concurrently, repeats bounded group termination on timeout, and owns an exact per-run temporary directory. Production recovery uses a unique release and controlled scheduler restart so systemd clears historical private temporary data while every new invocation cleans its own directory.
 
-**Tech Stack:** Rust 1.97, Tokio 1, libc 0.2, Playwright/Node, systemd, Docker
+**Tech Stack:** Rust 1.97, Tokio 1, libc 0.2, tempfile 3, Playwright/Node, systemd, Docker
+
+**Status:** Completed and deployed as production release `20260901T054951Z-browser-process-tree-v3-6c7b1122`.
 
 **Spec:** `docs/superpowers/specs/2026-09-01-browser-timeout-process-tree-design.md`
 
@@ -63,13 +65,15 @@ Expected: build fails because `run_browser_process` and its output/error types d
 
 Enable Tokio `io-util`, add workspace `libc = "0.2"`, and add `libc.workspace = true` under the core agent's Unix target dependencies.
 
+Also add `tempfile = "3"` and assign `TMPDIR`, `TMP`, and `TEMP` to a unique `uth-browser-run-*` directory for every invocation.
+
 - [ ] **Step 2: Create the supervisor**
 
 Configure a new process group on Unix before spawn, take stdout and stderr, drain both with Tokio tasks, and wait for the child under `tokio::time::timeout`.
 
 - [ ] **Step 3: Implement timeout cleanup**
 
-On Unix signal `-pgid` with `SIGKILL`; on every platform invoke the direct-child kill fallback, wait for the child, and join both pipe readers. Preserve `browser fallback exceeded <n> seconds` and append a cleanup error only if termination or reap fails.
+On Unix signal `-pgid` with `SIGKILL`, repeat bounded group sweeps for 250 milliseconds to close the concurrent-fork race, invoke the direct-child kill fallback, wait for the child, join both pipe readers, and close the exact temporary directory. Preserve `browser fallback exceeded <n> seconds` and append a cleanup error only if termination, reap, pipe drain, or directory removal fails.
 
 - [ ] **Step 4: Route browser fallback through the supervisor**
 

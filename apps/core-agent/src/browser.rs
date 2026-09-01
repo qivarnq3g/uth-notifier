@@ -143,6 +143,27 @@ fn kill_browser_process_group(_process_group_id: Option<u32>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(unix)]
+async fn settle_browser_process_group(process_group_id: Option<u32>) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if let Err(error) = kill_browser_process_group(process_group_id) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(not(unix))]
+async fn settle_browser_process_group(_process_group_id: Option<u32>) -> Result<(), String> {
+    Ok(())
+}
+
 async fn terminate_browser_process(
     child: &mut Child,
     process_group_id: Option<u32>,
@@ -158,6 +179,9 @@ async fn terminate_browser_process(
     }
     if let Err(error) = child.wait().await {
         errors.push(format!("browser direct-child reap failed: {error}"));
+    }
+    if let Err(error) = settle_browser_process_group(process_group_id).await {
+        errors.push(error);
     }
     if errors.is_empty() {
         Ok(())

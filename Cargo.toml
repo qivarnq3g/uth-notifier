@@ -32,6 +32,7 @@ sqlx = { version = "0.8", default-features = false, features = ["chrono", "json"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "signal", "sync", "time"] }
 url = "2"
 libc = "0.2"
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1

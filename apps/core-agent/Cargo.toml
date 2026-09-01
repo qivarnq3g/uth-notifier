@@ -20,6 +20,7 @@ sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 url.workspace = true
+tempfile.workspace = true
 uth-classifier = { path = "../../crates/classifier" }
 uth-crawler = { path = "../../crates/crawler" }
 uth-delivery = { path = "../../crates/delivery" }

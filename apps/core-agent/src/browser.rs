@@ -170,6 +170,43 @@ async fn run_browser_process(
     command: &mut Command,
     browser_timeout: Duration,
 ) -> Result<BrowserProcessOutput, BrowserProcessError> {
+    let browser_temp_directory = tempfile::Builder::new()
+        .prefix("uth-browser-run-")
+        .tempdir()
+        .map_err(|error| {
+            BrowserProcessError::Execution(format!(
+                "failed to create browser temporary directory: {error}"
+            ))
+        })?;
+    command
+        .env("TMPDIR", browser_temp_directory.path())
+        .env("TMP", browser_temp_directory.path())
+        .env("TEMP", browser_temp_directory.path());
+    let result = run_browser_process_in_temp(command, browser_timeout).await;
+    let cleanup_error = browser_temp_directory
+        .close()
+        .err()
+        .map(|error| format!("browser temporary-directory cleanup failed: {error}"));
+    match (result, cleanup_error) {
+        (Ok(output), None) => Ok(output),
+        (Ok(_), Some(error)) => Err(BrowserProcessError::Execution(error)),
+        (Err(BrowserProcessError::Execution(error)), Some(cleanup)) => Err(
+            BrowserProcessError::Execution(format!("{error}; {cleanup}")),
+        ),
+        (Err(BrowserProcessError::TimedOut(existing)), Some(cleanup)) => {
+            let cleanup = existing
+                .map(|error| format!("{error}; {cleanup}"))
+                .unwrap_or(cleanup);
+            Err(BrowserProcessError::TimedOut(Some(cleanup)))
+        }
+        (Err(error), None) => Err(error),
+    }
+}
+
+async fn run_browser_process_in_temp(
+    command: &mut Command,
+    browser_timeout: Duration,
+) -> Result<BrowserProcessOutput, BrowserProcessError> {
     configure_browser_process_group(command);
     command
         .stdout(Stdio::piped())
@@ -474,12 +511,16 @@ mod tests {
         ));
         fs::create_dir(&task_directory).unwrap();
         let descendant_pid_path = task_directory.join("descendant.pid");
+        let browser_temp_path = task_directory.join("browser-temp.path");
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("sleep 30 & echo $! > \"$1\"; wait")
+            .arg(
+                "printf %s \"$TMPDIR\" > \"$2\"; case \"$TMPDIR\" in */uth-browser-run-*) mkdir -p \"$TMPDIR/playwright-test-residue\";; esac; sleep 30 & echo $! > \"$1\"; wait",
+            )
             .arg("sh")
             .arg(&descendant_pid_path)
+            .arg(&browser_temp_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -508,7 +549,17 @@ mod tests {
             .ok()
             .and_then(|stat| stat.split_whitespace().nth(2).map(str::to_owned));
         assert!(state.is_none() || state.as_deref() == Some("Z"));
+        let browser_temp_directory = fs::read_to_string(&browser_temp_path).unwrap();
+        assert!(
+            Path::new(&browser_temp_directory)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("uth-browser-run-")
+        );
+        assert!(!Path::new(&browser_temp_directory).exists());
         fs::remove_file(descendant_pid_path).unwrap();
+        fs::remove_file(browser_temp_path).unwrap();
         fs::remove_dir(task_directory).unwrap();
     }
 

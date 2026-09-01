@@ -31,15 +31,15 @@
 - Consumes: existing `apply_browser_fallback` timeout behavior
 - Produces: Unix regression tests for `run_browser_process(&mut Command, Duration)`
 
-- [ ] **Step 1: Write a Unix-only failing timeout test**
+- [x] **Step 1: Write a Unix-only failing timeout test**
 
 Add a Tokio test that runs `sh -c 'sleep 30 & echo $! > "$1"; wait'`, passes a task-owned PID-file path, invokes the not-yet-implemented `run_browser_process`, and asserts that the returned failure is a timeout and the background PID disappears within two seconds.
 
-- [ ] **Step 2: Write a failing success-path test**
+- [x] **Step 2: Write a failing success-path test**
 
 Run `sh -c 'printf stdout; printf stderr >&2'` through `run_browser_process` and assert a successful status, stdout `stdout`, and stderr `stderr`.
 
-- [ ] **Step 3: Verify RED on Linux**
+- [x] **Step 3: Verify RED on Linux**
 
 Run:
 
@@ -61,25 +61,25 @@ Expected: build fails because `run_browser_process` and its output/error types d
 - Consumes: `tokio::process::Command`, browser timeout `Duration`
 - Produces: `run_browser_process(&mut Command, Duration) -> Result<BrowserProcessOutput, BrowserProcessError>`
 
-- [ ] **Step 1: Add required dependencies**
+- [x] **Step 1: Add required dependencies**
 
 Enable Tokio `io-util`, add workspace `libc = "0.2"`, and add `libc.workspace = true` under the core agent's Unix target dependencies.
 
 Also add `tempfile = "3"` and assign `TMPDIR`, `TMP`, and `TEMP` to a unique `uth-browser-run-*` directory for every invocation.
 
-- [ ] **Step 2: Create the supervisor**
+- [x] **Step 2: Create the supervisor**
 
 Configure a new process group on Unix before spawn, take stdout and stderr, drain both with Tokio tasks, and wait for the child under `tokio::time::timeout`.
 
-- [ ] **Step 3: Implement timeout cleanup**
+- [x] **Step 3: Implement timeout cleanup**
 
 On Unix signal `-pgid` with `SIGKILL`, repeat bounded group sweeps for 250 milliseconds to close the concurrent-fork race, invoke the direct-child kill fallback, wait for the child, join both pipe readers, and close the exact temporary directory. Preserve `browser fallback exceeded <n> seconds` and append a cleanup error only if termination, reap, pipe drain, or directory removal fails.
 
-- [ ] **Step 4: Route browser fallback through the supervisor**
+- [x] **Step 4: Route browser fallback through the supervisor**
 
 Replace `timeout(browser_timeout, command.output())` with `run_browser_process` while keeping snapshot parsing, outcome classification, and stderr truncation unchanged.
 
-- [ ] **Step 5: Verify GREEN on Linux**
+- [x] **Step 5: Verify GREEN on Linux**
 
 Run:
 
@@ -100,11 +100,11 @@ Expected: focused browser tests pass, including the descendant-process timeout r
 - Consumes: completed process supervisor
 - Produces: tested Linux amd64 release binary and SHA-256
 
-- [ ] **Step 1: Run formatting checks**
+- [x] **Step 1: Run formatting checks**
 
 Run `cargo fmt --all -- --check` and fix only files touched by this task.
 
-- [ ] **Step 2: Run the full Linux workspace test suite**
+- [x] **Step 2: Run the full Linux workspace test suite**
 
 Run the pinned builder with `/build/config` mounted read-only:
 
@@ -114,7 +114,7 @@ docker run --rm -v "${PWD}/config:/build/config:ro" uth-notifier-rust-builder:br
 
 Expected: all non-ignored workspace tests pass.
 
-- [ ] **Step 3: Build and extract the release binary**
+- [x] **Step 3: Build and extract the release binary**
 
 Build the pinned `rust-builder` target with `cargo build --locked --release -p uth-agent`, copy `/build/target/release/uth-agent` from a task-created container to `target/deploy/uth-agent-browser-process-tree`, remove that exact container, and compute SHA-256 locally.
 
@@ -128,27 +128,27 @@ Build the pinned `rust-builder` target with `cargo build --locked --release -p u
 - Consumes: verified Linux binary and current production release
 - Produces: atomically switched scheduler runtime with retained rollback release
 
-- [ ] **Step 1: Record pre-cutover state**
+- [x] **Step 1: Record pre-cutover state**
 
 Record the resolved current release, scheduler PID/owner, unit status, restart count, active leases owned by that scheduler, private Playwright directory counts, memory, swap, and recent crawl outcome counts without printing sensitive payloads.
 
-- [ ] **Step 2: Upload and verify**
+- [x] **Step 2: Upload and verify**
 
 Upload to a unique `/tmp` file, compare remote SHA-256 to the local value, copy the active release into a new unique release, replace only `bin/uth-agent`, and validate the binary with `--help`.
 
-- [ ] **Step 3: Cut over atomically**
+- [x] **Step 3: Cut over atomically**
 
 Switch `/opt/uth-notifier/current` atomically, restart only `uth-notifier-scheduler`, and verify no source leases remain for the old `uth-agent-<pid>` owner.
 
-- [ ] **Step 4: Verify resource recovery**
+- [x] **Step 4: Verify resource recovery**
 
 Confirm systemd removed the old scheduler `PrivateTmp`, abandoned profile/artifact counts are zero or belong only to active bounded runs, swap and memory pressure decline, no Chromium remains blocked in `mem_cgroup_handle_over_high`, and Chromium crash-report pending remains empty.
 
-- [ ] **Step 5: Verify functional recovery**
+- [x] **Step 5: Verify functional recovery**
 
 Wait for fresh `crawl-scheduler-cycle.v1` records and database crawl runs. Require stable unit activity, non-increasing `NRestarts`, no new timeout-directory accumulation, and at least one healthy presentation when Facebook returns a usable page; if Facebook only returns login walls, require bounded completion without resource leakage.
 
-- [ ] **Step 6: Remove exact staging artifacts**
+- [x] **Step 6: Remove exact staging artifacts**
 
 Delete only the task-created remote `/tmp` upload after checksum and runtime verification. Keep the local release artifact and both production releases.
 
@@ -162,14 +162,14 @@ Delete only the task-created remote `/tmp` upload after checksum and runtime ver
 - Consumes: verified production behavior
 - Produces: repeatable diagnosis, deployment, and rollback procedure
 
-- [ ] **Step 1: Update deployment guidance**
+- [x] **Step 1: Update deployment guidance**
 
 Document process-group timeout cleanup, private-temp verification, and the bounded post-deployment checks proven in production.
 
-- [ ] **Step 2: Update durable repository memory**
+- [x] **Step 2: Update durable repository memory**
 
 Replace the diagnostic-only browser timeout note with the verified fix and validation procedure, including any measured residual limitations.
 
-- [ ] **Step 3: Run documentation and diff checks**
+- [x] **Step 3: Run documentation and diff checks**
 
 Run `git diff --check` on the explicit task files and inspect `git status --short` to confirm unrelated user changes remain preserved.

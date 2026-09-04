@@ -34,22 +34,22 @@
   - `CrawlStore::record_ai_learning_feedback(&self, payload: AiLearningFeedbackPayload<'_>) -> Result<()>`
   - `CrawlStore::override_manual_review_resolution(&self, classification_id: i64, actor_chat_id: i64, authorized_admin_chat_id: i64, new_action: ManualReviewAction, reason: Option<&str>, notification: Option<ManualReviewNotification<'_>>) -> Result<ManualReviewOverrideOutcome>`
 
-- [ ] **Step 1: Write the failing test for storage methods**
+- [x] **Step 1: Write the failing test for storage methods**
 Add test `ai_learning_examples_and_manual_review_override` in `crates/storage/tests/postgres_storage.rs`.
 
-- [ ] **Step 2: Run test to confirm failure**
+- [x] **Step 2: Run test to confirm failure**
 Run `cargo test -p uth-storage --test postgres_storage ai_learning_examples_and_manual_review_override` to verify it fails compilation or execution.
 
-- [ ] **Step 3: Create migration `migrations/0022_gemini_auto_review.sql`**
+- [x] **Step 3: Create migration `migrations/0022_gemini_auto_review.sql`**
 Create table `ai_review_learning_examples` and its index.
 
-- [ ] **Step 4: Implement storage models and methods in `crates/storage/src/lib.rs`**
+- [x] **Step 4: Implement storage models and methods in `crates/storage/src/lib.rs`**
 Add `AiLearningExample`, `record_ai_learning_feedback`, `latest_ai_learning_examples`, and `override_manual_review_resolution`.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 Run `cargo test -p uth-storage --test postgres_storage` and verify all tests pass.
 
-- [ ] **Step 6: Commit changes**
+- [x] **Step 6: Commit changes**
 Git commit Task 1 files.
 
 ---
@@ -71,19 +71,19 @@ Git commit Task 1 files.
   - `GeminiReviewOutput` struct (`decision`, `reason`, `confidence`)
   - `GeminiReviewerClient::review_post(&self, source_name: &str, post_text: &str, post_url: &str, learning_examples: &[AiLearningExample]) -> Result<GeminiReviewOutput>`
 
-- [ ] **Step 1: Write unit tests with mock server in `gemini_reviewer.rs`**
+- [x] **Step 1: Write unit tests with mock server in `gemini_reviewer.rs`**
 Test serialization of structured request, injection of few-shot examples, deserialization of JSON response, and error handling for 429/500 responses.
 
-- [ ] **Step 2: Run tests to confirm failure**
+- [x] **Step 2: Run tests to confirm failure**
 Run `cargo test -p uth-agent gemini_reviewer`.
 
-- [ ] **Step 3: Implement `gemini_reviewer.rs`**
+- [x] **Step 3: Implement `gemini_reviewer.rs`**
 Implement client using `reqwest::Client` with timeout (10s), headers, system instructions for UTH student information criteria, JSON schema, and prompt formatting.
 
-- [ ] **Step 4: Run tests to confirm pass**
+- [x] **Step 4: Run tests to confirm pass**
 Run `cargo test -p uth-agent gemini_reviewer` and ensure all tests pass.
 
-- [ ] **Step 5: Commit changes**
+- [x] **Step 5: Commit changes**
 Git commit Task 2 files.
 
 ---
@@ -105,29 +105,29 @@ Git commit Task 2 files.
   - Telegram commands: `/ai_reject_{id}`, `/ai_approve_{id}` (and text command variants)
   - Admin notification formatting with actionable feedback commands
 
-- [ ] **Step 1: Write tests for autonomous review planning and Telegram command parsing**
+- [x] **Step 1: Write tests for autonomous review planning and Telegram command parsing**
 Add unit tests for `/ai_reject_{id}` and `/ai_approve_{id}` parsing in `notification_worker.rs`.
 
-- [ ] **Step 2: Run tests to confirm failure**
+- [x] **Step 2: Run tests to confirm failure**
 Run `cargo test -p uth-agent parse_ai_override_commands`.
 
-- [ ] **Step 3: Add CLI arguments and update `NotifyArgs`**
+- [x] **Step 3: Add CLI arguments and update `NotifyArgs`**
 Add `gemini_api_key`, `gemini_model`, `gemini_api_base` to `NotifyArgs`. Initialize `GeminiReviewerClient` when key is present.
 
-- [ ] **Step 4: Implement autonomous review handling in `plan_event_notification`**
+- [x] **Step 4: Implement autonomous review handling in `plan_event_notification`**
 When `ClassificationDecision::ManualReview` occurs:
 - If Gemini is configured: query DB for recent learning examples, call Gemini.
 - If `Send`: resolve review as Send, queue campaign, deliver, send admin alert with `/ai_reject_{id}` option.
 - If `Skip`: resolve review as Skip, send admin alert with `/ai_approve_{id}` option.
 - If Gemini fails: fall back to manual review detail message to Admin.
 
-- [ ] **Step 5: Implement `/ai_reject_{id}` and `/ai_approve_{id}` in `resolve_interaction_command`**
+- [x] **Step 5: Implement `/ai_reject_{id}` and `/ai_approve_{id}` in `resolve_interaction_command`**
 Handle admin correction commands, update database resolution, queue campaigns if approved, and record feedback into `ai_review_learning_examples`.
 
-- [ ] **Step 6: Run tests to verify passing status**
+- [x] **Step 6: Run tests to verify passing status**
 Run `cargo test -p uth-agent` to verify all tests pass.
 
-- [ ] **Step 7: Commit changes**
+- [x] **Step 7: Commit changes**
 Git commit Task 3 files.
 
 ---
@@ -138,11 +138,11 @@ Git commit Task 3 files.
 - Test: Full cargo test suite (`cargo test --workspace`)
 - Verify: `cargo clippy --workspace` and `cargo check --workspace`
 
-- [ ] **Step 1: Run full workspace test suite**
+- [x] **Step 1: Run full workspace test suite**
 Run `cargo test --workspace`.
 
-- [ ] **Step 2: Run clippy and format checks**
+- [x] **Step 2: Run clippy and format checks**
 Run `cargo clippy --workspace --all-targets -- -D warnings`.
 
-- [ ] **Step 3: Verify clean workspace and commit history**
+- [x] **Step 3: Verify clean workspace and commit history**
 Verify git status is clean and all deliverables match specification.

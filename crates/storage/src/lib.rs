@@ -2909,6 +2909,34 @@ impl CrawlStore {
         row.map(manual_review_from_row).transpose()
     }
 
+    pub async fn any_manual_review(
+        &self,
+        classification_id: i64,
+    ) -> Result<Option<ManualReviewRecord>> {
+        if classification_id <= 0 {
+            bail!("manual review classification ID must be positive");
+        }
+        let row = sqlx::query(
+            "SELECT classification.id AS classification_id, classification.post_id, \
+                    source.name AS source_name, source.source_key, post.external_post_id, \
+                    revision.canonical_url, revision.published_at, revision.text, \
+                    revision.media, revision.outbound_links, revision.crawl_strategy, \
+                    revision.fetched_at, classification.input_content_hash, \
+                    classification.score, classification.confidence_basis_points, \
+                    classification.matched_rules, classification.classified_at \
+             FROM classifications AS classification \
+             JOIN posts AS post ON post.id = classification.post_id \
+             JOIN sources AS source ON source.id = post.source_id \
+             JOIN post_revisions AS revision ON revision.post_id = post.id \
+                AND revision.content_hash = classification.input_content_hash \
+             WHERE classification.id = $1 AND classification.decision = 'manual_review'",
+        )
+        .bind(classification_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(manual_review_from_row).transpose()
+    }
+
     pub async fn inherit_duplicate_manual_review_resolution(
         &self,
         classification_id: i64,

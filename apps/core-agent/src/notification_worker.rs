@@ -14,15 +14,16 @@ use uth_delivery::{
 };
 use uth_domain::{ClassificationDecision, ClassificationResult};
 use uth_storage::{
-    ClaimedDelivery, ClaimedDigestDelivery, ClaimedNotificationEvent, CrawlHistoryDetail,
-    CrawlHistoryRecord, CrawlStore, DeliveryFailureClass, DeliveryRetentionOutcome,
-    DonationIntentPaymentLink, DonationPayment, FailureDisposition, LatestPostRecord,
-    ManualReviewAction, ManualReviewNotification, ManualReviewRecord, NotificationContent,
-    NotificationPlanOutcome, OperationalAlertKind, OperationalHealth, PortalNoticeHistoryRecord,
-    PortalNoticePlanOutcome, PortalNoticeRecord, PortalPollState, USER_STOP_REASON,
-    UserFeedbackHistoryRecord,
+    AiLearningFeedbackPayload, ClaimedDelivery, ClaimedDigestDelivery, ClaimedNotificationEvent,
+    CrawlHistoryDetail, CrawlHistoryRecord, CrawlStore, DeliveryFailureClass,
+    DeliveryRetentionOutcome, DonationIntentPaymentLink, DonationPayment, FailureDisposition,
+    LatestPostRecord, ManualReviewAction, ManualReviewNotification, ManualReviewRecord,
+    NotificationContent, NotificationPlanOutcome, OperationalAlertKind, OperationalHealth,
+    PortalNoticeHistoryRecord, PortalNoticePlanOutcome, PortalNoticeRecord, PortalPollState,
+    USER_STOP_REASON, UserFeedbackHistoryRecord,
 };
 
+use crate::gemini_reviewer::{GeminiReviewDecision, GeminiReviewerClient};
 use crate::payos::PayOsClient;
 use crate::portal::{
     PortalAttachment, PortalClient, PortalFailureKind, PortalNotice, TELEGRAM_DOCUMENT_LIMIT,
@@ -127,6 +128,23 @@ pub struct NotifyArgs {
 
     #[arg(long, env = "PAYOS_CANCEL_URL")]
     payos_cancel_url: Option<url::Url>,
+
+    #[arg(long, env = "GEMINI_API_KEY", hide_env_values = true)]
+    pub gemini_api_key: Option<String>,
+
+    #[arg(
+        long,
+        env = "GEMINI_MODEL",
+        default_value = "gemini-3.5-flash-lite"
+    )]
+    pub gemini_model: String,
+
+    #[arg(
+        long,
+        env = "GEMINI_API_BASE",
+        default_value = "https://generativelanguage.googleapis.com"
+    )]
+    pub gemini_api_base: url::Url,
 
     #[arg(long, default_value_t = 1800)]
     donation_link_ttl: i64,
@@ -235,6 +253,9 @@ pub struct NotifyArgs {
 
     #[arg(long, default_value_t = TELEGRAM_DOCUMENT_LIMIT)]
     portal_max_file_bytes: usize,
+
+    #[arg(long, env = "PORTAL_MAX_NOTICE_AGE_HOURS", default_value_t = 48)]
+    portal_max_notice_age_hours: i64,
 
     #[arg(long)]
     once: bool,
@@ -511,6 +532,13 @@ pub async fn run(args: NotifyArgs) -> Result<()> {
         (None, None, None, None, None) => None,
         _ => bail!("all payOS credentials and return URLs must be configured together"),
     };
+    let gemini = args.gemini_api_key.as_ref().map(|key| {
+        GeminiReviewerClient::new(
+            key.clone(),
+            args.gemini_model.clone(),
+            args.gemini_api_base.clone(),
+        )
+    });
     if args.admin_only {
         store
             .deactivate_subscribers_except(
@@ -642,6 +670,7 @@ pub async fn run(args: NotifyArgs) -> Result<()> {
                 &store,
                 &telegram,
                 &portal,
+                gemini.as_ref(),
                 &owner,
                 &args,
                 CycleInputs {
@@ -1022,6 +1051,20 @@ fn add_portal_delay(timestamp: DateTime<Utc>, seconds: u64) -> Result<DateTime<U
         .context("Portal poll timestamp exceeds supported range")
 }
 
+fn should_archive_as_stale_portal_notice(
+    displayed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    max_age_hours: i64,
+) -> bool {
+    if max_age_hours <= 0 {
+        return false;
+    }
+    let Some(cutoff) = now.checked_sub_signed(ChronoDuration::hours(max_age_hours)) else {
+        return false;
+    };
+    displayed_at < cutoff
+}
+
 async fn run_portal_cycle(
     store: &CrawlStore,
     portal: &PortalClient,
@@ -1042,32 +1085,42 @@ async fn run_portal_cycle(
             return Result::<()>::Ok(());
         };
         let latest_portal_id = portal.latest_portal_id(1).await?;
-        if latest_portal_id <= cursor {
+        if latest_portal_id == cursor || store.portal_notice_exists(latest_portal_id).await? {
             return Ok(());
         }
         let notice_ids = portal
             .notice_ids_after(cursor, args.portal_page_size, args.portal_max_pages)
             .await?;
         report.notices_found = notice_ids.len();
+        let now = Utc::now();
         for portal_id in notice_ids {
             let mut notice = portal.fetch_notice(portal_id).await?;
             enrich_portal_notice_attachment(portal, &mut notice, &mut report).await;
-            let message_text = render_portal_notification(&notice);
-            let outcome = store
-                .plan_portal_notice(
-                    &PortalNoticeRecord {
-                        portal_id: notice.portal_id,
-                        title: &notice.title,
-                        displayed_at: notice.displayed_at,
-                        article_url: notice.article_url.as_deref(),
-                        attachment_url: notice.attachment_url.as_deref(),
-                        attachment_file_name: None,
-                        attachment_content_type: notice.attachment_content_type.as_deref(),
-                    },
-                    &message_text,
-                )
-                .await?;
-            accumulate_portal_plan(&mut report, &outcome);
+            let record = PortalNoticeRecord {
+                portal_id: notice.portal_id,
+                title: &notice.title,
+                displayed_at: notice.displayed_at,
+                article_url: notice.article_url.as_deref(),
+                attachment_url: notice.attachment_url.as_deref(),
+                attachment_file_name: None,
+                attachment_content_type: notice.attachment_content_type.as_deref(),
+            };
+            if should_archive_as_stale_portal_notice(
+                notice.displayed_at,
+                now,
+                args.portal_max_notice_age_hours,
+            ) {
+                if store.archive_portal_notice(&record).await? {
+                    report.history_archived += 1;
+                }
+            } else {
+                let message_text = render_portal_notification(&notice);
+                let outcome = store.plan_portal_notice(&record, &message_text).await?;
+                accumulate_portal_plan(&mut report, &outcome);
+            }
+        }
+        if latest_portal_id > 0 {
+            store.update_portal_notice_cursor(latest_portal_id).await?;
         }
         Ok(())
     }
@@ -1186,6 +1239,7 @@ async fn run_cycle(
     store: &CrawlStore,
     telegram: &TelegramClient,
     portal_client: &PortalClient,
+    gemini: Option<&GeminiReviewerClient>,
     owner: &str,
     args: &NotifyArgs,
     inputs: CycleInputs,
@@ -1207,7 +1261,7 @@ async fn run_cycle(
     let planned_events = events.len();
     let mut plans = Vec::with_capacity(events.len());
     for event in events {
-        plans.push(plan_event(store, telegram, owner, event, args).await);
+        plans.push(plan_event(store, telegram, gemini, owner, event, args).await);
     }
     let deliveries = store
         .claim_deliveries(
@@ -2530,6 +2584,104 @@ async fn build_interaction_reply(
                 format!("Bài #{id} đã được xử lý trước đó.")
             }))
         }
+        InteractionCommand::AiReject { id, reason } => {
+            let Some(authorized_admin_chat_id) =
+                context.admin_chat_id.filter(|admin| *admin == message.chat.id)
+            else {
+                return Ok(admin_only_reply());
+            };
+            let Some(review) = store.any_manual_review(id).await? else {
+                return Ok(simple_reply(format!(
+                    "Không tìm thấy bài #{id}."
+                )));
+            };
+            let outcome = store
+                .override_manual_review_resolution(
+                    id,
+                    message.chat.id,
+                    authorized_admin_chat_id,
+                    ManualReviewAction::Skip,
+                    reason.as_deref().or(Some("[Admin override: Không phù hợp]")),
+                    None,
+                )
+                .await?;
+            if outcome.overridden {
+                let _ = store
+                    .record_ai_learning_feedback(AiLearningFeedbackPayload {
+                        classification_id: Some(id),
+                        post_id: Some(review.database_post_id),
+                        post_text: &review.post.text,
+                        source_name: &review.source_name,
+                        ai_decision: "send",
+                        ai_reason: "Admin reported false positive",
+                        admin_decision: "skip",
+                        admin_notes: reason.as_deref(),
+                    })
+                    .await;
+                Ok(simple_reply(format!(
+                    "Đã ghi nhận bài #{id} là BỎ QUA. Tri thức này đã được đưa vào bộ nhớ học cho Gemini."
+                )))
+            } else {
+                Ok(simple_reply(format!(
+                    "Không thể cập nhật bài #{id}."
+                )))
+            }
+        }
+        InteractionCommand::AiApprove { id, reason } => {
+            let Some(authorized_admin_chat_id) =
+                context.admin_chat_id.filter(|admin| *admin == message.chat.id)
+            else {
+                return Ok(admin_only_reply());
+            };
+            let Some(review) = store.any_manual_review(id).await? else {
+                return Ok(simple_reply(format!(
+                    "Không tìm thấy bài #{id}."
+                )));
+            };
+            let notification = render_notification(&review.post);
+            let post_url = delivery_post_url(&review.post);
+            let outcome = store
+                .override_manual_review_resolution(
+                    id,
+                    message.chat.id,
+                    authorized_admin_chat_id,
+                    ManualReviewAction::Send,
+                    reason.as_deref().or(Some("[Admin override: Duyệt bài]")),
+                    Some(ManualReviewNotification {
+                        message_text: &notification,
+                        post_url: &post_url,
+                    }),
+                )
+                .await?;
+            if outcome.overridden {
+                let _ = store
+                    .record_ai_learning_feedback(AiLearningFeedbackPayload {
+                        classification_id: Some(id),
+                        post_id: Some(review.database_post_id),
+                        post_text: &review.post.text,
+                        source_name: &review.source_name,
+                        ai_decision: "skip",
+                        ai_reason: "Admin reported false negative",
+                        admin_decision: "send",
+                        admin_notes: reason.as_deref(),
+                    })
+                    .await;
+                Ok(simple_reply(if outcome.campaign_created {
+                    format!(
+                        "Đã đảo ngược quyết định bài #{id} thành DUYỆT. Đã tạo {} lượt gửi cho người nhận. Tri thức đã được cập nhật cho Gemini.",
+                        outcome.deliveries_created
+                    )
+                } else {
+                    format!(
+                        "Đã cập nhật bài #{id} thành DUYỆT. Tri thức đã được cập nhật cho Gemini."
+                    )
+                }))
+            } else {
+                Ok(simple_reply(format!(
+                    "Không thể duyệt bài #{id} (có thể đã có campaign gửi trước đó)."
+                )))
+            }
+        }
         InteractionCommand::Latest(page) => {
             let page_size = 5_usize;
             let offset = page.saturating_sub(1).saturating_mul(page_size);
@@ -2959,6 +3111,10 @@ fn display_classification_signal(rule: &str) -> &str {
         "hard.completed_summary" => "bài tổng kết hoạt động đã diễn ra",
         "hard.post_too_old" => "bài đăng đã quá cũ",
         "hard.unapproved_source" => "nguồn chưa được duyệt",
+        "risk.restricted_audience" => "đối tượng giới hạn theo khoa hoặc khóa",
+        "decision.restricted_audience_review" => {
+            "cần xác nhận hoạt động phù hợp với người dùng toàn bot"
+        }
         "decision.insufficient_evidence" => "chưa đủ thông tin để tự động gửi",
         "decision.no_actionable_evidence" => "không thấy lời mời tham gia rõ ràng",
         _ => "dấu hiệu khác",
@@ -3059,6 +3215,14 @@ enum InteractionCommand {
     Review(i64),
     ReviewSend(i64),
     ReviewSkip {
+        id: i64,
+        reason: Option<String>,
+    },
+    AiReject {
+        id: i64,
+        reason: Option<String>,
+    },
+    AiApprove {
         id: i64,
         reason: Option<String>,
     },
@@ -3327,6 +3491,44 @@ fn parse_interaction_command(text: &str) -> InteractionCommand {
                     reason: (!reason.is_empty()).then_some(reason),
                 }
             }
+            value if value.starts_with("/ai_reject_") => {
+                parse_positive_command_suffix(value, "/ai_reject_")
+                    .map(|id| InteractionCommand::AiReject { id, reason: None })
+                    .unwrap_or(InteractionCommand::Usage(
+                        "Mã bài không hợp lệ. Dùng /reviews để xem lại danh sách.",
+                    ))
+            }
+            value if value.starts_with("/ai_approve_") => {
+                parse_positive_command_suffix(value, "/ai_approve_")
+                    .map(|id| InteractionCommand::AiApprove { id, reason: None })
+                    .unwrap_or(InteractionCommand::Usage(
+                        "Mã bài không hợp lệ. Dùng /reviews để xem lại danh sách.",
+                    ))
+            }
+            "/ai_reject" => {
+                let Some(id) = parse_positive_id(parts.next()) else {
+                    return InteractionCommand::Usage(
+                        "Thiếu mã bài. Hãy bấm lệnh /ai_reject_ID trong tin chi tiết.",
+                    );
+                };
+                let reason = parts.collect::<Vec<_>>().join(" ");
+                InteractionCommand::AiReject {
+                    id,
+                    reason: (!reason.is_empty()).then_some(reason),
+                }
+            }
+            "/ai_approve" => {
+                let Some(id) = parse_positive_id(parts.next()) else {
+                    return InteractionCommand::Usage(
+                        "Thiếu mã bài. Hãy bấm lệnh /ai_approve_ID trong tin chi tiết.",
+                    );
+                };
+                let reason = parts.collect::<Vec<_>>().join(" ");
+                InteractionCommand::AiApprove {
+                    id,
+                    reason: (!reason.is_empty()).then_some(reason),
+                }
+            }
             value if value.starts_with("/review_") => {
                 parse_positive_command_suffix(value, "/review_")
                     .map(InteractionCommand::Review)
@@ -3583,11 +3785,20 @@ fn telegram_sender_label(chat: &TelegramChat) -> String {
 async fn plan_event(
     store: &CrawlStore,
     telegram: &TelegramClient,
+    gemini: Option<&GeminiReviewerClient>,
     owner: &str,
     event: ClaimedNotificationEvent,
     args: &NotifyArgs,
 ) -> PlanReport {
-    let result = plan_event_inner(store, telegram, owner, &event, args.admin_chat_id).await;
+    let result = plan_event_inner(
+        store,
+        telegram,
+        gemini,
+        owner,
+        &event,
+        args.admin_chat_id,
+    )
+    .await;
     match result {
         Ok(outcome) => PlanReport {
             event_key: event.event_key,
@@ -3620,6 +3831,7 @@ async fn plan_event(
 async fn plan_event_inner(
     store: &CrawlStore,
     telegram: &TelegramClient,
+    gemini: Option<&GeminiReviewerClient>,
     owner: &str,
     event: &ClaimedNotificationEvent,
     admin_chat_id: Option<i64>,
@@ -3665,19 +3877,94 @@ async fn plan_event_inner(
                     .manual_review(payload.database_classification_id)
                     .await?
             {
-                match telegram
-                    .send_message(admin_chat_id, &render_manual_review_detail(&review))
-                    .await
-                {
-                    TelegramSendOutcome::Sent { .. } => {}
-                    TelegramSendOutcome::RetryAfter { seconds, detail } => {
-                        bail!("Telegram yêu cầu chờ {seconds} giây khi báo bài cần duyệt: {detail}")
+                let mut resolved_by_gemini = false;
+                if let Some(gemini_client) = gemini {
+                    let examples = store.latest_ai_learning_examples(5).await.unwrap_or_default();
+                    let review_url = delivery_post_url(&review.post);
+                    match gemini_client
+                        .review_post(&review.source_name, &review.post.text, &review_url, &examples)
+                        .await
+                    {
+                        Ok(gemini_output) => {
+                            match gemini_output.decision {
+                                GeminiReviewDecision::Send => {
+                                    let notif_text = render_notification(&review.post);
+                                    let outcome = store
+                                        .resolve_manual_review(
+                                            payload.database_classification_id,
+                                            admin_chat_id,
+                                            admin_chat_id,
+                                            ManualReviewAction::Send,
+                                            Some(&format!("[Gemini AI] {}", gemini_output.reason)),
+                                            Some(ManualReviewNotification {
+                                                message_text: &notif_text,
+                                                post_url: &review_url,
+                                            }),
+                                        )
+                                        .await?;
+                                    if outcome.resolved {
+                                        resolved_by_gemini = true;
+                                        let admin_msg = format!(
+                                            "BÀI ĐÃ TỰ ĐỘNG DUYỆT BỞI GEMINI #{}\nNguồn: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\n{}\n\nNếu duyệt sai, bấm: /ai_reject_{}",
+                                            payload.database_classification_id,
+                                            review.source_name,
+                                            gemini_output.reason,
+                                            gemini_output.confidence * 100.0,
+                                            shorten_chars(&review.post.text, 500),
+                                            review_url,
+                                            payload.database_classification_id
+                                        );
+                                        let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                                    }
+                                }
+                                GeminiReviewDecision::Skip => {
+                                    let outcome = store
+                                        .resolve_manual_review(
+                                            payload.database_classification_id,
+                                            admin_chat_id,
+                                            admin_chat_id,
+                                            ManualReviewAction::Skip,
+                                            Some(&format!("[Gemini AI] {}", gemini_output.reason)),
+                                            None,
+                                        )
+                                        .await?;
+                                    if outcome.resolved {
+                                        resolved_by_gemini = true;
+                                        let admin_msg = format!(
+                                            "BÀI ĐÃ BỎ QUA BỞI GEMINI #{}\nNguồn: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\n{}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
+                                            payload.database_classification_id,
+                                            review.source_name,
+                                            gemini_output.reason,
+                                            gemini_output.confidence * 100.0,
+                                            shorten_chars(&review.post.text, 500),
+                                            review_url,
+                                            payload.database_classification_id
+                                        );
+                                        let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("Gemini review error, fallback to manual review: {err:#}");
+                        }
                     }
-                    TelegramSendOutcome::ChatMigrated { detail, .. }
-                    | TelegramSendOutcome::PermanentFailure { detail, .. }
-                    | TelegramSendOutcome::TransientFailure { detail }
-                    | TelegramSendOutcome::AuthenticationFailure { detail } => {
-                        bail!("không thể báo bài cần duyệt cho admin: {detail}")
+                }
+                if !resolved_by_gemini {
+                    match telegram
+                        .send_message(admin_chat_id, &render_manual_review_detail(&review))
+                        .await
+                    {
+                        TelegramSendOutcome::Sent { .. } => {}
+                        TelegramSendOutcome::RetryAfter { seconds, detail } => {
+                            bail!("Telegram yêu cầu chờ {seconds} giây khi báo bài cần duyệt: {detail}")
+                        }
+                        TelegramSendOutcome::ChatMigrated { detail, .. }
+                        | TelegramSendOutcome::PermanentFailure { detail, .. }
+                        | TelegramSendOutcome::TransientFailure { detail }
+                        | TelegramSendOutcome::AuthenticationFailure { detail } => {
+                            bail!("không thể báo bài cần duyệt cho admin: {detail}")
+                        }
                     }
                 }
             }
@@ -4157,7 +4444,7 @@ mod tests {
         render_crawl_history_detail, render_crawl_history_page, render_donation, render_help,
         render_operational_alert, render_operational_health, render_payment_account,
         render_portal_notice_history_detail, render_portal_notice_history_page, render_source_page,
-        render_user_feedback_page, retry_delay_seconds,
+        render_user_feedback_page, retry_delay_seconds, should_archive_as_stale_portal_notice,
     };
     use uth_storage::OperationalAlertKind;
 
@@ -4281,6 +4568,29 @@ mod tests {
             last_poll_outcome: None,
             last_http_status: None,
         }
+    }
+
+    #[test]
+    fn identifies_stale_portal_notices_beyond_threshold() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        let stale_displayed_at = Utc.with_ymd_and_hms(2026, 8, 26, 3, 0, 0).unwrap();
+        let fresh_displayed_at = Utc.with_ymd_and_hms(2026, 9, 4, 10, 0, 0).unwrap();
+
+        assert!(should_archive_as_stale_portal_notice(
+            stale_displayed_at,
+            now,
+            48
+        ));
+        assert!(!should_archive_as_stale_portal_notice(
+            fresh_displayed_at,
+            now,
+            48
+        ));
+        assert!(!should_archive_as_stale_portal_notice(
+            stale_displayed_at,
+            now,
+            0
+        ));
     }
 
     #[test]
@@ -4756,5 +5066,40 @@ mod tests {
         let alert = render_operational_alert(OperationalAlertKind::Degraded, &health);
         assert!(alert.contains("suy giảm đã kéo dài quá ngưỡng"));
         assert!(alert.contains("Việc đang chờ: 2 bài cần phân loại"));
+    }
+
+    #[test]
+    fn parses_ai_override_commands() {
+        match parse_interaction_command("/ai_reject_42") {
+            InteractionCommand::AiReject { id, reason } => {
+                assert_eq!(id, 42);
+                assert!(reason.is_none());
+            }
+            other => panic!("expected AiReject, got {other:?}"),
+        }
+
+        match parse_interaction_command("/ai_approve_84") {
+            InteractionCommand::AiApprove { id, reason } => {
+                assert_eq!(id, 84);
+                assert!(reason.is_none());
+            }
+            other => panic!("expected AiApprove, got {other:?}"),
+        }
+
+        match parse_interaction_command("/ai_reject 100 Sai thông tin") {
+            InteractionCommand::AiReject { id, reason } => {
+                assert_eq!(id, 100);
+                assert_eq!(reason.as_deref(), Some("Sai thông tin"));
+            }
+            other => panic!("expected AiReject with reason, got {other:?}"),
+        }
+
+        match parse_interaction_command("/ai_approve 200 Có ĐRL cấp trường") {
+            InteractionCommand::AiApprove { id, reason } => {
+                assert_eq!(id, 200);
+                assert_eq!(reason.as_deref(), Some("Có ĐRL cấp trường"));
+            }
+            other => panic!("expected AiApprove with reason, got {other:?}"),
+        }
     }
 }

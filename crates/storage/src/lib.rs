@@ -301,6 +301,40 @@ pub struct ManualReviewResolutionOutcome {
     pub deliveries_created: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualReviewOverrideOutcome {
+    pub overridden: bool,
+    pub previous_action: Option<String>,
+    pub campaign_created: bool,
+    pub deliveries_created: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiLearningExample {
+    pub id: i64,
+    pub classification_id: Option<i64>,
+    pub post_id: Option<i64>,
+    pub post_text: String,
+    pub source_name: String,
+    pub ai_decision: String,
+    pub ai_reason: String,
+    pub admin_decision: String,
+    pub admin_notes: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiLearningFeedbackPayload<'a> {
+    pub classification_id: Option<i64>,
+    pub post_id: Option<i64>,
+    pub post_text: &'a str,
+    pub source_name: &'a str,
+    pub ai_decision: &'a str,
+    pub ai_reason: &'a str,
+    pub admin_decision: &'a str,
+    pub admin_notes: Option<&'a str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimedNotificationEvent {
     pub id: i64,
@@ -3081,6 +3115,220 @@ impl CrawlStore {
         Ok(outcome)
     }
 
+    pub async fn override_manual_review_resolution(
+        &self,
+        classification_id: i64,
+        actor_chat_id: i64,
+        authorized_admin_chat_id: i64,
+        new_action: ManualReviewAction,
+        reason: Option<&str>,
+        notification: Option<ManualReviewNotification<'_>>,
+    ) -> Result<ManualReviewOverrideOutcome> {
+        if classification_id <= 0 || actor_chat_id == 0 || authorized_admin_chat_id == 0 {
+            bail!("manual review IDs must be valid");
+        }
+        if actor_chat_id != authorized_admin_chat_id {
+            bail!("manual review action is restricted to the configured administrator");
+        }
+        let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        if reason.is_some_and(|value| value.chars().count() > 1_000) {
+            bail!("manual review reason exceeds 1000 characters");
+        }
+        match (new_action, notification) {
+            (ManualReviewAction::Send, Some(content))
+                if (1..=4_096).contains(&content.message_text.chars().count())
+                    && !content.post_url.is_empty() => {}
+            (ManualReviewAction::Skip, None) => {}
+            (ManualReviewAction::Send, _) => {
+                bail!("sending a manual review requires a valid Telegram message and post URL")
+            }
+            (ManualReviewAction::Skip, _) => {
+                bail!("skipping a manual review cannot create a Telegram message or post URL")
+            }
+        }
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT classification.post_id, classification.decision, resolution.action \
+             FROM classifications AS classification \
+             LEFT JOIN manual_review_resolutions AS resolution \
+                ON resolution.classification_id = classification.id \
+             WHERE classification.id = $1 FOR UPDATE OF classification",
+        )
+        .bind(classification_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .context("manual review classification was not found")?;
+        let decision: String = row.get("decision");
+        if decision != "manual_review" {
+            bail!("classification is not eligible for manual review");
+        }
+        let prev_action: Option<String> = row.get("action");
+        let post_id: i64 = row.get("post_id");
+        sqlx::query("SELECT id FROM posts WHERE id = $1 FOR UPDATE")
+            .bind(post_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        let prior_campaign = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM campaigns WHERE post_id = $1 ORDER BY id LIMIT 1",
+        )
+        .bind(post_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if new_action == ManualReviewAction::Send && prior_campaign.is_some() {
+            transaction.rollback().await?;
+            return Ok(ManualReviewOverrideOutcome {
+                overridden: false,
+                previous_action: prev_action,
+                campaign_created: false,
+                deliveries_created: 0,
+            });
+        }
+
+        let new_action_str = match new_action {
+            ManualReviewAction::Send => "send",
+            ManualReviewAction::Skip => "skip",
+        };
+
+        sqlx::query(
+            "INSERT INTO manual_review_resolutions \
+             (classification_id, action, reviewed_by_chat_id, reason, reviewed_at) \
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) \
+             ON CONFLICT (classification_id) DO UPDATE SET \
+                action = EXCLUDED.action, \
+                reviewed_by_chat_id = EXCLUDED.reviewed_by_chat_id, \
+                reason = EXCLUDED.reason, \
+                reviewed_at = CURRENT_TIMESTAMP",
+        )
+        .bind(classification_id)
+        .bind(new_action_str)
+        .bind(actor_chat_id)
+        .bind(reason)
+        .execute(&mut *transaction)
+        .await?;
+
+        let mut outcome = ManualReviewOverrideOutcome {
+            overridden: true,
+            previous_action: prev_action,
+            campaign_created: false,
+            deliveries_created: 0,
+        };
+
+        if let Some(notification) = notification {
+            let campaign_id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO campaigns \
+                 (classification_id, post_id, message_text, post_url, action_url, explicit_drl) \
+                 SELECT $1, $2, $3, $4, \
+                    COALESCE(features.extracted -> 'form_links' ->> 0, revision.outbound_links ->> 0), \
+                    COALESCE(features.explicit_drl, FALSE) \
+                 FROM classifications AS classification \
+                 LEFT JOIN classification_features AS features ON features.classification_id = classification.id \
+                 JOIN post_revisions AS revision ON revision.post_id = classification.post_id \
+                    AND revision.content_hash = classification.input_content_hash \
+                 WHERE classification.id = $1 RETURNING id",
+            )
+            .bind(classification_id)
+            .bind(post_id)
+            .bind(notification.message_text)
+            .bind(notification.post_url)
+            .fetch_one(&mut *transaction)
+            .await?;
+            outcome.campaign_created = true;
+            outcome.deliveries_created = sqlx::query(
+                "INSERT INTO deliveries (campaign_id, subscriber_id, available_at) \
+                 SELECT $1, subscriber.id, \
+                    CASE \
+                      WHEN subscriber.quiet_hours_enabled AND EXTRACT(HOUR FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok') >= 22 \
+                        THEN (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok') + INTERVAL '1 day 7 hours') AT TIME ZONE 'Asia/Bangkok' \
+                      WHEN subscriber.quiet_hours_enabled AND EXTRACT(HOUR FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok') < 7 \
+                        THEN (date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok') + INTERVAL '7 hours') AT TIME ZONE 'Asia/Bangkok' \
+                      ELSE CURRENT_TIMESTAMP \
+                    END \
+                 FROM subscribers AS subscriber \
+                 JOIN campaigns AS campaign ON campaign.id = $1 \
+                 WHERE subscriber.active AND subscriber.onboarding_completed_at IS NOT NULL \
+                   AND subscriber.delivery_mode = 'instant' \
+                   AND (subscriber.notification_scope = 'all' OR campaign.explicit_drl) \
+                 ON CONFLICT (campaign_id, subscriber_id) DO NOTHING",
+            )
+            .bind(campaign_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            sqlx::query(
+                "INSERT INTO digest_items (subscriber_id, campaign_id) \
+                 SELECT subscriber.id, $1 FROM subscribers AS subscriber \
+                 JOIN campaigns AS campaign ON campaign.id = $1 \
+                 WHERE subscriber.active AND subscriber.onboarding_completed_at IS NOT NULL \
+                   AND subscriber.delivery_mode = 'daily' \
+                   AND (subscriber.notification_scope = 'all' OR campaign.explicit_drl) \
+                 ON CONFLICT (subscriber_id, campaign_id) DO NOTHING",
+            )
+            .bind(campaign_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+
+    pub async fn record_ai_learning_feedback(
+        &self,
+        payload: AiLearningFeedbackPayload<'_>,
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO ai_review_learning_examples \
+             (classification_id, post_id, post_text, source_name, ai_decision, ai_reason, admin_decision, admin_notes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             RETURNING id",
+        )
+        .bind(payload.classification_id)
+        .bind(payload.post_id)
+        .bind(payload.post_text)
+        .bind(payload.source_name)
+        .bind(payload.ai_decision)
+        .bind(payload.ai_reason)
+        .bind(payload.admin_decision)
+        .bind(payload.admin_notes)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn latest_ai_learning_examples(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<AiLearningExample>> {
+        let limit = limit.clamp(1, 50);
+        let rows = sqlx::query(
+            "SELECT id, classification_id, post_id, post_text, source_name, \
+                    ai_decision, ai_reason, admin_decision, admin_notes, created_at \
+             FROM ai_review_learning_examples \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut examples = Vec::with_capacity(rows.len());
+        for row in rows {
+            examples.push(AiLearningExample {
+                id: row.get("id"),
+                classification_id: row.get("classification_id"),
+                post_id: row.get("post_id"),
+                post_text: row.get("post_text"),
+                source_name: row.get("source_name"),
+                ai_decision: row.get("ai_decision"),
+                ai_reason: row.get("ai_reason"),
+                admin_decision: row.get("admin_decision"),
+                admin_notes: row.get("admin_notes"),
+                created_at: row.get("created_at"),
+            });
+        }
+        Ok(examples)
+    }
+
     pub async fn claim_notification_events(
         &self,
         owner: &str,
@@ -3259,6 +3507,62 @@ impl CrawlStore {
         Ok(inserted == 1)
     }
 
+    pub async fn update_portal_notice_cursor(&self, latest_portal_id: i64) -> Result<()> {
+        if latest_portal_id < 0 {
+            bail!("Portal notice cursor cannot be negative");
+        }
+        let rows = sqlx::query(
+            "UPDATE portal_notice_state SET last_seen_portal_id = $1, updated_at = CURRENT_TIMESTAMP \
+             WHERE singleton = TRUE",
+        )
+        .bind(latest_portal_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows != 1 {
+            bail!("Portal notice cursor is not initialized");
+        }
+        Ok(())
+    }
+
+    pub async fn portal_notice_exists(&self, portal_id: i64) -> Result<bool> {
+        if portal_id <= 0 {
+            return Ok(false);
+        }
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM portal_notices WHERE portal_id = $1)",
+        )
+        .bind(portal_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn unobserved_portal_notice_ids(&self, candidate_ids: &[i64]) -> Result<Vec<i64>> {
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let valid_ids = candidate_ids
+            .iter()
+            .copied()
+            .filter(|id| *id > 0)
+            .collect::<Vec<_>>();
+        if valid_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let existing = sqlx::query_scalar::<_, i64>(
+            "SELECT portal_id FROM portal_notices WHERE portal_id = ANY($1)",
+        )
+        .bind(&valid_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let existing_set: std::collections::HashSet<i64> = existing.into_iter().collect();
+        Ok(valid_ids
+            .into_iter()
+            .filter(|id| !existing_set.contains(id))
+            .collect())
+    }
+
     pub async fn plan_portal_notice(
         &self,
         notice: &PortalNoticeRecord<'_>,
@@ -3266,19 +3570,14 @@ impl CrawlStore {
     ) -> Result<PortalNoticePlanOutcome> {
         validate_portal_notice(notice, message_text)?;
         let mut transaction = self.pool.begin().await?;
-        let cursor = sqlx::query_scalar::<_, i64>(
-            "SELECT last_seen_portal_id FROM portal_notice_state \
-             WHERE singleton = TRUE FOR UPDATE",
+        let cursor_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM portal_notice_state WHERE singleton = TRUE)",
         )
-        .fetch_optional(&mut *transaction)
-        .await?
-        .context("Portal notice cursor is not initialized")?;
-        if notice.portal_id <= cursor {
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !cursor_exists {
             transaction.rollback().await?;
-            return Ok(PortalNoticePlanOutcome {
-                skipped: true,
-                ..PortalNoticePlanOutcome::default()
-            });
+            bail!("Portal notice cursor is not initialized");
         }
         let notice_created = sqlx::query(
             "INSERT INTO portal_notices \
@@ -3298,6 +3597,13 @@ impl CrawlStore {
         .await?
         .rows_affected()
             == 1;
+        if !notice_created {
+            transaction.rollback().await?;
+            return Ok(PortalNoticePlanOutcome {
+                skipped: true,
+                ..PortalNoticePlanOutcome::default()
+            });
+        }
         let campaign_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO campaigns \
              (portal_notice_id, message_text, post_url, attachment_url, \
@@ -3364,6 +3670,15 @@ impl CrawlStore {
         .execute(&self.pool)
         .await?
         .rows_affected();
+        if inserted == 1 {
+            let _ = sqlx::query(
+                "UPDATE portal_notice_state SET last_seen_portal_id = GREATEST(last_seen_portal_id, $1), \
+                    updated_at = CURRENT_TIMESTAMP WHERE singleton = TRUE",
+            )
+            .bind(notice.portal_id)
+            .execute(&self.pool)
+            .await;
+        }
         Ok(inserted == 1)
     }
 

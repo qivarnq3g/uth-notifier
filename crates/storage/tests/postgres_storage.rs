@@ -6,9 +6,10 @@ use uth_domain::{
     MediaItem, POST_SCHEMA_VERSION, REPORT_SCHEMA_VERSION,
 };
 use uth_storage::{
-    CrawlStore, DeliveryFailureClass, DonationIntentPaymentLink, DonationPayment,
-    FailureDisposition, ManualReviewAction, ManualReviewNotification, NotificationContent,
-    OperationalAlertKind, PortalNoticeRecord, PortalPollState, SourceSeed, USER_STOP_REASON,
+    AiLearningFeedbackPayload, CrawlStore, DeliveryFailureClass, DonationIntentPaymentLink,
+    DonationPayment, FailureDisposition, ManualReviewAction, ManualReviewNotification,
+    ManualReviewOverrideOutcome, NotificationContent, OperationalAlertKind, PortalNoticeRecord,
+    PortalPollState, SourceSeed, USER_STOP_REASON,
 };
 
 #[tokio::test]
@@ -1253,6 +1254,54 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
     assert_eq!(outcome.deliveries_created, 2);
     assert_eq!(store.portal_notice_cursor().await.unwrap(), Some(101));
 
+    assert!(store.portal_notice_exists(101).await.unwrap());
+    assert!(!store.portal_notice_exists(99).await.unwrap());
+    assert_eq!(
+        store
+            .unobserved_portal_notice_ids(&[101, 99, 102])
+            .await
+            .unwrap(),
+        vec![99, 102]
+    );
+
+    let duplicate_outcome = store
+        .plan_portal_notice(
+            &PortalNoticeRecord {
+                portal_id: 101,
+                title: "Thông báo trùng lặp",
+                displayed_at,
+                article_url: None,
+                attachment_url: None,
+                attachment_file_name: None,
+                attachment_content_type: None,
+            },
+            "Thông báo bắt buộc từ Portal UTH",
+        )
+        .await
+        .unwrap();
+    assert!(duplicate_outcome.skipped);
+    assert!(!duplicate_outcome.notice_created);
+    assert!(!duplicate_outcome.campaign_created);
+
+    let out_of_order_outcome = store
+        .plan_portal_notice(
+            &PortalNoticeRecord {
+                portal_id: 99,
+                title: "Thông báo ID nhỏ hơn cursor",
+                displayed_at,
+                article_url: None,
+                attachment_url: None,
+                attachment_file_name: None,
+                attachment_content_type: None,
+            },
+            "Thông báo bắt buộc từ Portal UTH",
+        )
+        .await
+        .unwrap();
+    assert!(out_of_order_outcome.notice_created);
+    assert!(out_of_order_outcome.campaign_created);
+    assert_eq!(store.portal_notice_cursor().await.unwrap(), Some(101));
+
     let owner = "portal-test-worker";
     let first_batch = store.claim_deliveries(owner, 10, 60).await.unwrap();
     assert_eq!(first_batch.len(), 1);
@@ -1472,3 +1521,59 @@ fn edge_event(sequence: i64, text: &str) -> EdgeEvent {
         }),
     }
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
+async fn ai_learning_examples_and_manual_review_override() {
+    let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let store = CrawlStore::connect(&database_url, 2).await.unwrap();
+    store.migrate().await.unwrap();
+
+    let feedback_id = store
+        .record_ai_learning_feedback(AiLearningFeedbackPayload {
+            classification_id: None,
+            post_id: None,
+            post_text: "Tuyển dụng việc làm thêm ngoài trường",
+            source_name: "CLB Việc làm",
+            ai_decision: "send",
+            ai_reason: "Có từ khóa việc làm",
+            admin_decision: "skip",
+            admin_notes: Some("Không phải đối tác UTH"),
+        })
+        .await
+        .unwrap();
+    assert!(feedback_id > 0);
+
+    let examples = store.latest_ai_learning_examples(5).await.unwrap();
+    assert!(!examples.is_empty());
+    let latest = &examples[0];
+    assert_eq!(latest.source_name, "CLB Việc làm");
+    assert_eq!(latest.ai_decision, "send");
+    assert_eq!(latest.admin_decision, "skip");
+    assert_eq!(latest.admin_notes.as_deref(), Some("Không phải đối tác UTH"));
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_review_learning_examples")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(count >= 1);
+
+    let override_err = store
+        .override_manual_review_resolution(
+            999_999,
+            123_456_789,
+            123_456_789,
+            ManualReviewAction::Skip,
+            Some("Override test"),
+            None,
+        )
+        .await;
+    assert!(override_err.is_err());
+    assert!(!ManualReviewOverrideOutcome::default().overridden);
+}
+

@@ -3,6 +3,7 @@ mod classifier_evaluation;
 mod classifier_review;
 mod classifier_worker;
 mod edge_reconciler;
+pub mod gemini_reviewer;
 mod notification_worker;
 mod operational_health;
 mod payos;

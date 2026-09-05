@@ -98,10 +98,7 @@ impl GeminiReviewerClient {
         learning_examples: &[AiLearningExample],
     ) -> Result<GeminiReviewOutput> {
         let base = self.api_base.as_str().trim_end_matches('/');
-        let endpoint = format!(
-            "{base}/v1beta/models/{}:generateContent?key={}",
-            self.model, self.api_key
-        );
+        let endpoint = format!("{base}/v1beta/models/{}:generateContent", self.model);
         let prompt = build_user_prompt(source_name, post_text, post_url, learning_examples);
         let request_payload = GeminiGenerateRequest {
             system_instruction: GeminiContent {
@@ -139,6 +136,7 @@ impl GeminiReviewerClient {
         let response = self
             .client
             .post(&endpoint)
+            .header("x-goog-api-key", &self.api_key)
             .json(&request_payload)
             .send()
             .await

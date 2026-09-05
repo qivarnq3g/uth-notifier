@@ -1,6 +1,6 @@
 {
   "schema_version": "facebook-drl-source-selection.v1",
-  "generated_at": "2026-07-19T04:23:47.9083749Z",
+  "generated_at": "2026-09-05T23:21:45.0000000Z",
   "recommended_sources": [
     {"id":"100063825503222","name":"ITClub","url":"https://www.facebook.com/ITClubUTH/"},
     {"id":"61590435791495","name":"Tuổi trẻ Địa lý - Đô thị","url":"https://www.facebook.com/people/Tu%E1%BB%95i-tr%E1%BA%BB-%C4%90%E1%BB%8Ba-l%C3%BD-%C4%90%C3%B4-th%E1%BB%8B/61590435791495/"},
@@ -44,6 +44,12 @@
     {"id":"100064088320549","name":"Đoàn Thanh niên - Hội Sinh viên Đại học Giao thông vận tải TP. Hồ Chí Minh","url":"https://www.facebook.com/doanhoiuth/"},
     {"id":"100069085234503","name":"Trường Đại học Giao thông vận tải TP.HCM","url":"https://www.facebook.com/TruongDHGiaothongvantaiTPHCM/"},
     {"id":"61566022178073","name":"CLB Nghiên cứu khoa học Viện Hàng hải","url":"https://www.facebook.com/people/CLB-Nghi%C3%AAn-c%E1%BB%A9u-khoa-h%E1%BB%8Dc-Vi%E1%BB%87n-H%C3%A0ng-h%E1%BA%A3i/61566022178073/"},
-    {"id":"61552165332621","name":"Viện Nghiên cứu - Đào tạo Đèo Cả Trường Đại học Giao thông vận tải TP. HCM","url":"https://www.facebook.com/people/Vi%E1%BB%87n-Nghi%C3%AAn-c%E1%BB%A9u-%C4%90%C3%A0o-t%E1%BA%A1o-%C4%90%C3%A8o-C%E1%BA%A3-Tr%C6%B0%E1%BB%9Dng-%C4%90%E1%BA%A1i-h%E1%BB%8Dc-Giao-th%C3%B4ng-v%E1%BA%ADn-t%E1%BA%A3i-TP-HCM/61552165332621/"}
+    {"id":"61552165332621","name":"Viện Nghiên cứu - Đào tạo Đèo Cả Trường Đại học Giao thông vận tải TP. HCM","url":"https://www.facebook.com/people/Vi%E1%BB%87n-Nghi%C3%AAn-c%E1%BB%A9u-%C4%90%C3%A0o-t%E1%BA%A1o-%C4%90%C3%A8o-C%E1%BA%A3-Tr%C6%B0%E1%BB%9Dng-%C4%90%E1%BA%A1i-h%E1%BB%8Dc-Giao-th%C3%B4ng-v%E1%BA%ADn-t%E1%BA%A3i-TP-HCM/61552165332621/"},
+    {"id":"100067425754129","name":"Viet Nam Young Logistics Talents","url":"https://www.facebook.com/VNYLT/"},
+    {"id":"100064867710931","name":"Khoa Hệ Thống Thông Tin - Trường ĐH Công nghệ Thông tin","url":"https://www.facebook.com/uit.khoahttt/"},
+    {"id":"100080244168723","name":"FIT HCMUS Kênh Tuyển dụng","url":"https://www.facebook.com/fit.hcmus.tuyendung/"},
+    {"id":"100067037901928","name":"Tuyển dụng Samsung Việt Nam","url":"https://www.facebook.com/tuyendungssvn/"},
+    {"id":"100063698947828","name":"Đoàn - Hội khoa Giáo dục","url":"https://www.facebook.com/DoanHoikhoaGiaoduc/"},
+    {"id":"61586011614651","name":"Tuổi trẻ Công tác xã hội - Nhân học - Xã hội học","url":"https://www.facebook.com/tuoitresas/"}
   ]
 }

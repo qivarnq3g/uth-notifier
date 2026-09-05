@@ -1419,7 +1419,7 @@ mod tests {
             .map(|source| facebook_crawl_target(&source.id, &source.url).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(targets.len(), 43);
+        assert_eq!(targets.len(), 49);
         assert_eq!(
             targets
                 .iter()
@@ -1434,7 +1434,7 @@ mod tests {
                     target.presentation_kind == "numeric_people_with_profile_fallback"
                 })
                 .count(),
-            40
+            46
         );
     }
 

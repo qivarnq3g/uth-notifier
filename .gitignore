@@ -12,9 +12,12 @@ skills-lock.json
 backups/
 deploy/secrets/
 AGENTS.md
+AGENTS_old.md
 AGENTS.local.md
 CLAUDE.local.md
+/bai-dang-facebook-uth-notifier.md
 apps/edge-worker/build/
 apps/edge-worker/.wrangler/
 apps/edge-worker/wrangler.production.toml
 apps/browser-agent/dist/
+docs/

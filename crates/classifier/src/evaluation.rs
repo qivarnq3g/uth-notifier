@@ -223,8 +223,8 @@ mod tests {
         let dataset: EvaluationDataset = serde_json::from_slice(CASES).unwrap();
         let report = classifier.evaluate(&dataset).unwrap();
 
-        assert_eq!(report.case_count, 13);
-        assert_eq!(report.exact_decision_matches, 13);
+        assert_eq!(report.case_count, 15);
+        assert_eq!(report.exact_decision_matches, 15);
         assert_eq!(report.notification_precision_basis_points, Some(10_000));
         assert_eq!(report.notification_recall_basis_points, Some(10_000));
         assert!(report.failures.is_empty());

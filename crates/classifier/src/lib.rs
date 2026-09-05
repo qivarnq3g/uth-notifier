@@ -54,6 +54,7 @@ struct KeywordConfig {
     registration_call: Vec<String>,
     location: Vec<String>,
     target_students: Vec<String>,
+    restricted_audience: Vec<String>,
     negative_commercial: Vec<String>,
     completed_summary: Vec<String>,
     deadline_context: Vec<String>,
@@ -139,6 +140,8 @@ impl RuleClassifier {
             ),
             past_event,
         };
+        let restricted_audience =
+            contains_any(&normalized, &self.config.keywords.restricted_audience);
         let completed_summary = contains_any(&normalized, &self.config.keywords.completed_summary);
         let post_too_old =
             now.signed_duration_since(published_at).num_days() > self.config.max_post_age_days;
@@ -154,6 +157,9 @@ impl RuleClassifier {
         }
         if !approved_source {
             matched_rules.push("hard.unapproved_source".to_owned());
+        }
+        if restricted_audience {
+            matched_rules.push("risk.restricted_audience".to_owned());
         }
         let score = score_features(&features, &self.config.weights);
         let hard_reject = !approved_source
@@ -172,6 +178,9 @@ impl RuleClassifier {
             && (features.future_event_time || features.future_deadline || features.location);
         let decision = if hard_reject {
             ClassificationDecision::Rejected
+        } else if restricted_audience {
+            matched_rules.push("decision.restricted_audience_review".to_owned());
+            ClassificationDecision::ManualReview
         } else if explicit_match {
             matched_rules.push("decision.explicit_threshold".to_owned());
             ClassificationDecision::MatchedExplicit
@@ -223,7 +232,8 @@ impl RuleClassifier {
                 "form_links": form_links,
                 "past_deadline": past_deadline,
                 "completed_summary": completed_summary,
-                "post_too_old": post_too_old
+                "post_too_old": post_too_old,
+                "restricted_audience": restricted_audience
             }),
             classifier_version: self.config.classifier_version.clone(),
             config_hash: self.config_hash.clone(),
@@ -522,6 +532,53 @@ mod tests {
                 .matched_rules
                 .contains(&"decision.registration_form_threshold".to_owned())
         );
+    }
+
+    #[test]
+    fn faculty_restricted_explicit_activity_requires_review() {
+        let classifier = RuleClassifier::from_bytes(CONFIG).unwrap();
+        let mut post = post(
+            "sha256:restricted-explicit",
+            "Mời tân sinh viên của Khoa Công nghệ đăng ký hoạt động có điểm rèn luyện. Thời gian 25/07/2026 tại Hội trường A.",
+        );
+        post.outbound_links = vec!["https://forms.gle/example".to_owned()];
+        let result = classifier.classify(&post, true, now()).unwrap();
+
+        assert_eq!(result.decision, ClassificationDecision::ManualReview);
+        assert_eq!(result.extracted["restricted_audience"], true);
+        assert!(
+            result
+                .matched_rules
+                .contains(&"decision.restricted_audience_review".to_owned())
+        );
+    }
+
+    #[test]
+    fn faculty_team_recruitment_requires_review() {
+        let classifier = RuleClassifier::from_bytes(CONFIG).unwrap();
+        let mut post = post(
+            "sha256:restricted-team",
+            "Tuyển thành viên đội hình Khoa Địa lý dành cho sinh viên khóa 2026. Đăng ký tham gia trước ngày 25/07/2026 tại link đăng ký.",
+        );
+        post.outbound_links = vec!["https://forms.gle/example".to_owned()];
+        let result = classifier.classify(&post, true, now()).unwrap();
+
+        assert_eq!(result.decision, ClassificationDecision::ManualReview);
+        assert_eq!(result.extracted["restricted_audience"], true);
+    }
+
+    #[test]
+    fn university_wide_explicit_activity_still_matches() {
+        let classifier = RuleClassifier::from_bytes(CONFIG).unwrap();
+        let mut post = post(
+            "sha256:university-wide",
+            "Mời sinh viên toàn trường đăng ký tham gia hoạt động có điểm rèn luyện. Hạn đăng ký 25/07/2026 tại Hội trường A.",
+        );
+        post.outbound_links = vec!["https://forms.gle/example".to_owned()];
+        let result = classifier.classify(&post, true, now()).unwrap();
+
+        assert_eq!(result.decision, ClassificationDecision::MatchedExplicit);
+        assert_eq!(result.extracted["restricted_audience"], false);
     }
 
     #[test]

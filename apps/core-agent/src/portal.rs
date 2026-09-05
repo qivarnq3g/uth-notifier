@@ -173,9 +173,11 @@ impl PortalClient {
             let page = self.fetch_page(page_number, page_size).await?;
             let empty = page.content.is_empty();
             for item in page.content {
-                if item.id <= last_seen_portal_id {
+                if item.id == last_seen_portal_id {
                     reached_boundary = true;
-                } else {
+                    break;
+                }
+                if item.id > 0 {
                     notices.insert(item.id, ());
                 }
             }
@@ -482,7 +484,7 @@ pub fn render_portal_notification(notice: &PortalNotice) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| notice.displayed_at.format("%d/%m/%Y").to_string());
-    let header = "Thông báo bắt buộc từ Portal UTH";
+    let header = "Thông báo từ Cổng đào tạo UTH (Portal)";
     let footer = format!("\n\nNgày đăng: {displayed_at}");
     let reserved = header.chars().count() + footer.chars().count() + 2;
     let title = truncate_chars(&notice.title, 1_024_usize.saturating_sub(reserved));
@@ -785,6 +787,30 @@ mod tests {
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("GET /notification?page=1&size=2"));
         assert!(requests[1].starts_with("GET /notification?page=2&size=2"));
+    }
+
+    #[tokio::test]
+    async fn catches_up_when_feed_ids_are_not_monotonic() {
+        let (base_url, server) = mock_server(vec![(
+            200,
+            r#"{"success":true,"body":{"content":[{"id":1443},{"id":1444}],"totalPages":1}}"#,
+        )])
+        .await;
+        let client = PortalClient::new(
+            Url::parse(&base_url).unwrap(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.notice_ids_after(1444, 2, 1).await.unwrap(),
+            vec![1443]
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /notification?page=1&size=2"));
     }
 
     #[tokio::test]

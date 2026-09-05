@@ -105,6 +105,22 @@
       "approved_source": true,
       "published_at": "2026-07-18T13:00:00+00:00",
       "expected_decision": "matched_explicit"
+    },
+    {
+      "id": "faculty-restricted-explicit-activity",
+      "text": "Mời tân sinh viên của Khoa Công nghệ đăng ký hoạt động có điểm rèn luyện. Thời gian 25/07/2026 tại Hội trường A.",
+      "outbound_links": ["https://forms.gle/example"],
+      "approved_source": true,
+      "published_at": "2026-07-18T14:00:00+00:00",
+      "expected_decision": "manual_review"
+    },
+    {
+      "id": "faculty-team-registration",
+      "text": "Tuyển thành viên đội hình Khoa Địa lý dành cho sinh viên khóa 2026. Đăng ký tham gia trước ngày 25/07/2026 tại link đăng ký.",
+      "outbound_links": ["https://forms.gle/example"],
+      "approved_source": true,
+      "published_at": "2026-07-18T15:00:00+00:00",
+      "expected_decision": "manual_review"
     }
   ]
 }

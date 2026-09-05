@@ -19,7 +19,7 @@ Mỗi kết quả chứa:
   "matched_rules": ["feature.explicit_drl", "decision.explicit_threshold"],
   "features": {},
   "extracted": {},
-  "classifier_version": "rules-2026-07-29-online-participation",
+  "classifier_version": "rules-2026-08-27-restricted-audience",
   "config_hash": "sha256:...",
   "classified_at": "2026-07-19T12:00:00+00:00"
 }
@@ -51,6 +51,11 @@ host tin cậy, lời kêu gọi đăng ký, đối tượng sinh viên, nguồn
 ngữ cảnh thời gian/địa điểm và score đạt `registration_form_match_score`. Form đơn
 lẻ, bài không nhắm tới sinh viên hoặc thiếu ngữ cảnh hoạt động vẫn vào review hoặc
 bị từ chối; hard reject luôn được áp dụng trước nhánh này.
+
+Bài giới hạn đối tượng theo khoa, khóa hoặc đội hình không được tự gửi, kể cả khi có
+ĐRL hoặc form hợp lệ. Rule `risk.restricted_audience` chuyển bài sang
+`manual_review` để quản trị viên xác nhận mức phù hợp với toàn bộ người dùng bot.
+Hoạt động ghi rõ dành cho sinh viên toàn trường không bị rule này chặn.
 
 ## Durable worker
 
@@ -108,7 +113,7 @@ tra nguyên nhân. Dataset lịch sử có thể đặt `evaluated_at` riêng ch
 chạy lại classifier tại thời điểm bài được đăng, tránh dùng hạn đăng ký đã qua ở
 thời điểm review làm sai backtest.
 
-Fixture trong repository gồm 13 ca tổng hợp để bảo vệ regression của rules và CLI.
+Fixture trong repository gồm 15 ca tổng hợp để bảo vệ regression của rules và CLI.
 Kết quả trên fixture này không được trình bày như chất lượng đo từ dữ liệu thật.
 Đánh giá production cần một dataset riêng gồm bài đăng thực tế đã được người có
 thẩm quyền gán nhãn và rà soát định kỳ.

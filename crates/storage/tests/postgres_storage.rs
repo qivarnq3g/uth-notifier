@@ -1555,7 +1555,10 @@ async fn ai_learning_examples_and_manual_review_override() {
     assert_eq!(latest.source_name, "CLB Việc làm");
     assert_eq!(latest.ai_decision, "send");
     assert_eq!(latest.admin_decision, "skip");
-    assert_eq!(latest.admin_notes.as_deref(), Some("Không phải đối tác UTH"));
+    assert_eq!(
+        latest.admin_notes.as_deref(),
+        Some("Không phải đối tác UTH")
+    );
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_review_learning_examples")
         .fetch_one(&pool)
@@ -1576,4 +1579,3 @@ async fn ai_learning_examples_and_manual_review_override() {
     assert!(override_err.is_err());
     assert!(!ManualReviewOverrideOutcome::default().overridden);
 }
-

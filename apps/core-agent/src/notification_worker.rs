@@ -10,17 +10,17 @@ use uth_delivery::{
     TELEGRAM_DOCUMENT_TIMEOUT_SECONDS, TelegramChat, TelegramClient, TelegramConfigurationOutcome,
     TelegramIncomingMessage, TelegramSendOutcome, TelegramUpdatesOutcome, TelegramUserLink,
     delivery_post_url, humanize_notification_sample, render_notification,
-    render_structured_notification,
 };
 use uth_domain::{ClassificationDecision, ClassificationResult};
 use uth_storage::{
-    AiLearningFeedbackPayload, ClaimedDelivery, ClaimedDigestDelivery, ClaimedNotificationEvent,
-    CrawlHistoryDetail, CrawlHistoryRecord, CrawlStore, DeliveryFailureClass,
-    DeliveryRetentionOutcome, DonationIntentPaymentLink, DonationPayment, FailureDisposition,
-    LatestPostRecord, ManualReviewAction, ManualReviewNotification, ManualReviewRecord,
-    NotificationContent, NotificationPlanOutcome, OperationalAlertKind, OperationalHealth,
-    PortalNoticeHistoryRecord, PortalNoticePlanOutcome, PortalNoticeRecord, PortalPollState,
-    USER_STOP_REASON, UserFeedbackHistoryRecord,
+    ActiveEventRecord, AiLearningFeedbackPayload, ClaimedDelivery, ClaimedDigestDelivery,
+    ClaimedNotificationEvent, CrawlHistoryDetail, CrawlHistoryRecord, CrawlStore,
+    DeliveryFailureClass, DeliveryRetentionOutcome, DonationIntentPaymentLink, DonationPayment,
+    FailureDisposition, GrowthMetrics, LatestPostRecord, ManualReviewAction,
+    ManualReviewNotification, ManualReviewRecord, NotificationContent, NotificationPlanOutcome,
+    OperationalAlertKind, OperationalHealth, PortalNoticeHistoryRecord, PortalNoticePlanOutcome,
+    PortalNoticeRecord, PortalPollState, SystemReportStats, USER_STOP_REASON,
+    UserFeedbackHistoryRecord,
 };
 
 use crate::gemini_reviewer::{GeminiReviewDecision, GeminiReviewerClient};
@@ -132,11 +132,7 @@ pub struct NotifyArgs {
     #[arg(long, env = "GEMINI_API_KEY", hide_env_values = true)]
     pub gemini_api_key: Option<String>,
 
-    #[arg(
-        long,
-        env = "GEMINI_MODEL",
-        default_value = "gemini-3.5-flash-lite"
-    )]
+    #[arg(long, env = "GEMINI_MODEL", default_value = "gemini-3.5-flash-lite")]
     pub gemini_model: String,
 
     #[arg(
@@ -1921,11 +1917,11 @@ async fn build_interaction_reply(
                 return Ok(InteractionReply {
                     user_text: if was_active {
                         with_support_group(
-                            "Thông báo đang bật. Bạn có thể xem một tin mẫu hoặc đổi loại hoạt động và cách nhận bên dưới.",
+                            "Hệ thống đang bật thông báo hoạt động cho bạn. Bạn có thể xem tin mẫu hoặc tùy chỉnh lại cài đặt nhận tin bên dưới.",
                         )
                     } else {
                         with_support_group(
-                            "Đã bật lại thông báo với cài đặt trước đây. Bạn có thể xem một tin mẫu hoặc điều chỉnh bên dưới.",
+                            "Đã bật lại thông báo theo các cài đặt trước đó của bạn. Bạn có thể xem tin mẫu hoặc tùy chỉnh lại cài đặt nhận tin bên dưới.",
                         )
                     },
                     user_links: Vec::new(),
@@ -1943,11 +1939,11 @@ async fn build_interaction_reply(
             let greeting = display_name
                 .as_deref()
                 .map(|name| format!("Chào {name}. "))
-                .unwrap_or_default();
+                .unwrap_or_else(|| "Xin chào bạn. ".to_owned());
             let source_count = store.list_enabled_sources().await?.len();
             Ok(InteractionReply {
                 user_text: with_support_group(&format!(
-                    "{greeting}UTH Notifier đang lọc {source_count} nguồn công khai để tìm hoạt động, biểu mẫu đăng ký và thông tin điểm rèn luyện.\n\nBạn muốn nhận loại tin nào? Bạn có thể đổi lại bất cứ lúc nào."
+                    "{greeting}UTH Notifier là hệ thống hỗ trợ sinh viên Trường Đại học Giao thông vận tải TP.HCM (UTH) tự động cập nhật hoạt động phong trào, điểm rèn luyện và thông báo đào tạo.\n\nHệ thống hiện đang lọc {source_count} nguồn công khai để tìm hoạt động, biểu mẫu đăng ký và học bổng.\n\nBạn vui lòng chọn loại thông báo muốn nhận bên dưới (có thể thay đổi bất cứ lúc nào trong mục Cài đặt):"
                 )),
                 user_links: Vec::new(),
                 photo_png: None,
@@ -1966,9 +1962,9 @@ async fn build_interaction_reply(
                 .complete_subscriber_onboarding(message.chat.id, scope)
                 .await?;
             Ok(simple_reply(if scope == "drl" {
-                "Đã bật thông báo cho các hoạt động có nhắc tới điểm rèn luyện. Bạn có thể đổi trong Cài đặt.".to_owned()
+                "Đã thiết lập: Bạn sẽ nhận các thông báo hoạt động có nhắc tới điểm rèn luyện. Bạn có thể điều chỉnh lại bất cứ lúc nào trong mục Cài đặt.".to_owned()
             } else {
-                "Đã bật thông báo cho mọi hoạt động phù hợp. Bạn có thể đổi trong Cài đặt.".to_owned()
+                "Đã thiết lập: Bạn sẽ nhận tất cả các thông báo hoạt động sinh viên phù hợp. Bạn có thể điều chỉnh lại bất cứ lúc nào trong mục Cài đặt.".to_owned()
             }))
         }
         InteractionCommand::OnboardSample => {
@@ -1978,10 +1974,10 @@ async fn build_interaction_reply(
             let sample = store.latest_notification_sample().await?.map(|message| {
                 humanize_notification_sample(&message)
             }).unwrap_or_else(|| {
-                "Chưa có tin mẫu trong hệ thống. Bạn vẫn có thể chọn loại tin để bắt đầu nhận bài mới.".to_owned()
+                "Hiện chưa có tin mẫu trong hệ thống. Bạn vui lòng chọn loại thông báo bên dưới để bắt đầu nhận tin mới.".to_owned()
             });
             Ok(InteractionReply {
-                user_text: format!("Tin mẫu gần nhất:\n\n{sample}\n\nChọn loại tin bạn muốn nhận:"),
+                user_text: format!("Dưới đây là một tin mẫu gần nhất để bạn tham khảo định dạng thông báo:\n\n{sample}\n\nBạn vui lòng chọn loại thông báo muốn nhận:"),
                 user_links: Vec::new(),
                 photo_png: None,
                 portal_document: None,
@@ -1998,7 +1994,7 @@ async fn build_interaction_reply(
             let subscriber = store.subscriber(message.chat.id).await?;
             if subscriber.is_none() {
                 return Ok(InteractionReply {
-                    user_text: "Bạn chưa bật thông báo. Hãy chọn loại tin muốn nhận để bắt đầu."
+                    user_text: "Bạn chưa kích hoạt nhận thông báo. Vui lòng chọn loại thông báo muốn nhận bên dưới để bắt đầu sử dụng."
                         .to_owned(),
                     user_links: Vec::new(),
                     photo_png: None,
@@ -2014,14 +2010,14 @@ async fn build_interaction_reply(
             }
             let status = subscriber.map(|value| {
                 format!(
-                    "Loại hoạt động: {}\nCách nhận: {}\nGiờ yên lặng (22:00–07:00): {}",
+                    "Loại hoạt động: {}\nCách nhận: {}\nKhung giờ yên lặng (22:00–07:00): {}",
                     if value.notification_scope == "drl" { "Chỉ tin có điểm rèn luyện" } else { "Mọi hoạt động phù hợp" },
                     if value.delivery_mode == "daily" { "Một bản tin lúc 07:30" } else { "Từng tin ngay khi phát hiện" },
                     if value.quiet_hours_enabled { "Bật" } else { "Tắt" }
                 )
             }).unwrap_or_else(|| "Bạn cần chọn Bật thông báo trước.".to_owned());
             Ok(InteractionReply {
-                user_text: format!("Cài đặt hiện tại:\n\n{status}\n\nThông báo mới từ Portal UTH là bắt buộc và không bị ảnh hưởng bởi các lựa chọn này.\n\nChọn mục muốn thay đổi:"),
+                user_text: format!("Cài đặt nhận thông báo hiện tại:\n\n{status}\n\nLưu ý: Các thông báo quan trọng từ Cổng đào tạo UTH (Portal) luôn được gửi trực tiếp và không bị ảnh hưởng bởi các tùy chọn trên.\n\nBạn vui lòng chọn mục muốn thay đổi bên dưới:"),
                 user_links: Vec::new(),
                 photo_png: None,
                 portal_document: None,
@@ -2048,11 +2044,11 @@ async fn build_interaction_reply(
                 .await?
                 .map(|message| humanize_notification_sample(&message))
                 .unwrap_or_else(|| {
-                    "Chưa có tin mẫu trong hệ thống. Bot sẽ báo khi có hoạt động phù hợp mới."
+                    "Hiện chưa có tin mẫu trong hệ thống. Hệ thống sẽ tự động gửi thông báo khi có hoạt động phù hợp mới."
                         .to_owned()
                 });
             Ok(InteractionReply {
-                user_text: format!("Tin mẫu gần nhất:\n\n{sample}\n\nBạn có thể tiếp tục đổi cài đặt bên dưới:"),
+                user_text: format!("Dưới đây là định dạng tin mẫu gần nhất:\n\n{sample}\n\nBạn có thể tiếp tục tùy chỉnh cài đặt bên dưới:"),
                 user_links: Vec::new(),
                 photo_png: None,
                 portal_document: None,
@@ -2068,25 +2064,25 @@ async fn build_interaction_reply(
         InteractionCommand::SettingsScope(scope) => {
             store.update_subscriber_preferences(message.chat.id, Some(scope), None, None).await?;
             Ok(simple_reply(if scope == "drl" {
-                "Từ giờ, bot chỉ gửi hoạt động có nhắc tới điểm rèn luyện.".to_owned()
+                "Đã cập nhật cài đặt: Bạn sẽ chỉ nhận các thông báo hoạt động có nhắc tới điểm rèn luyện.".to_owned()
             } else {
-                "Từ giờ, bot gửi mọi hoạt động được đánh giá là phù hợp.".to_owned()
+                "Đã cập nhật cài đặt: Bạn sẽ nhận tất cả các thông báo hoạt động sinh viên phù hợp.".to_owned()
             }))
         }
         InteractionCommand::SettingsMode(mode) => {
             store.update_subscriber_preferences(message.chat.id, None, Some(mode), None).await?;
             Ok(simple_reply(if mode == "daily" {
-                "Từ giờ, bot sẽ gom các hoạt động mới phù hợp và gửi một bản tin lúc 07:30 mỗi ngày. Nếu không có tin mới, bot sẽ không gửi.".to_owned()
+                "Đã cập nhật: Hệ thống sẽ tổng hợp các hoạt động mới phù hợp thành một bản tin duy nhất gửi vào 07:30 mỗi ngày (nếu không có hoạt động mới, hệ thống sẽ không gửi bản tin).".to_owned()
             } else {
-                "Từ giờ, bot sẽ gửi từng hoạt động phù hợp ngay khi phát hiện, theo cài đặt giờ yên lặng của bạn.".to_owned()
+                "Đã cập nhật: Hệ thống sẽ gửi thông báo riêng cho từng hoạt động ngay khi phát hiện (tuân thủ theo cài đặt giờ yên lặng của bạn).".to_owned()
             }))
         }
         InteractionCommand::SettingsQuiet(enabled) => {
             store.update_subscriber_preferences(message.chat.id, None, None, Some(enabled)).await?;
             Ok(simple_reply(if enabled {
-                "Đã bật giờ yên lặng từ 22:00 đến 07:00. Tin cần gửi ngay trong khoảng này sẽ được giữ lại đến sau 07:00.".to_owned()
+                "Đã bật khung giờ yên lặng (22:00 đến 07:00). Các thông báo phát sinh trong khoảng thời gian này sẽ được giữ lại và gửi sau 07:00 sáng hôm sau.".to_owned()
             } else {
-                "Đã tắt giờ yên lặng. Bot sẽ gửi theo cách nhận bạn đã chọn.".to_owned()
+                "Đã tắt khung giờ yên lặng. Các thông báo hoạt động sẽ được gửi ngay theo thời gian thực.".to_owned()
             }))
         }
         InteractionCommand::UserFeedbackPrompt => {
@@ -2097,7 +2093,7 @@ async fn build_interaction_reply(
                 .begin_user_feedback_input(message.chat.id, expires_at)
                 .await?;
             Ok(simple_reply(
-                "Bạn muốn góp ý điều gì? Hãy gửi nội dung trong tin nhắn tiếp theo. Bạn có 10 phút; gửi /cancel nếu đổi ý."
+                "Bạn vui lòng gửi nội dung ý kiến đóng góp hoặc báo lỗi trong tin nhắn tiếp theo (phiên nhập có hiệu lực trong 10 phút). Nếu muốn hủy thao tác, bạn có thể gửi lệnh /cancel."
                     .to_owned(),
             ))
         }
@@ -2107,19 +2103,19 @@ async fn build_interaction_reply(
                 .record_user_feedback(message.chat.id, update_id, &sender_label, &feedback)
                 .await?;
             Ok(simple_reply(
-                "Mình đã nhận feedback và chuyển cho quản trị viên. Cảm ơn bạn đã góp ý.".to_owned(),
+                "Hệ thống đã nhận được ý kiến đóng góp của bạn và chuyển đến ban quản trị để xem xét. Cảm ơn bạn đã hỗ trợ hoàn thiện UTH Notifier.".to_owned(),
             ))
         }
         InteractionCommand::Feedback { campaign_id, value } => {
             let outcome = store.record_notification_feedback(message.chat.id, campaign_id, value).await?;
             if outcome.should_prompt_donation && context.payos.is_some() {
                 Ok(InteractionReply {
-                    user_text: "Cảm ơn phản hồi của bạn. Nếu thông báo này đã giúp ích, bạn có thể hỗ trợ một phần chi phí vận hành. Việc ủng hộ hoàn toàn tự nguyện và không ảnh hưởng quyền dùng bot.".to_owned(),
-                user_links: Vec::new(),
-                photo_png: None,
-                portal_document: None,
-                portal_source_url: None,
-                donation_prompt: true,
+                    user_text: "Cảm ơn phản hồi của bạn. Nếu UTH Notifier mang lại giá trị thiết thực cho bạn, bạn có thể cân nhắc ủng hộ một phần kinh phí duy trì máy chủ. Việc ủng hộ là hoàn toàn tự nguyện và không ảnh hưởng đến bất kỳ quyền lợi sử dụng nào của bạn.".to_owned(),
+                    user_links: Vec::new(),
+                    photo_png: None,
+                    portal_document: None,
+                    portal_source_url: None,
+                    donation_prompt: true,
                     onboarding_prompt: false,
                     settings_prompt: false,
                     complete_donation_amount_input: false,
@@ -2128,9 +2124,9 @@ async fn build_interaction_reply(
                 })
             } else {
                 Ok(simple_reply(if value == "useful" {
-                    "Đã ghi nhận đây là thông báo hữu ích.".to_owned()
+                    "Cảm ơn bạn. Hệ thống đã ghi nhận đánh giá hữu ích để tiếp tục ưu tiên các thông báo tương tự.".to_owned()
                 } else {
-                    "Đã ghi nhận. Phản hồi này sẽ được dùng để cải thiện độ phù hợp.".to_owned()
+                    "Cảm ơn bạn. Hệ thống đã ghi nhận phản hồi này để điều chỉnh và nâng cao độ chính xác cho các thông báo sau.".to_owned()
                 }))
             }
         }
@@ -2139,8 +2135,8 @@ async fn build_interaction_reply(
                 .open_campaign_action(message.chat.id, campaign_id)
                 .await?;
             Ok(simple_reply(match action {
-                Some(url) => format!("Mở biểu mẫu đăng ký:\n{url}"),
-                None => "Link đăng ký không còn khả dụng. Bạn có thể mở bài gốc để kiểm tra.".to_owned(),
+                Some(url) => format!("Biểu mẫu đăng ký tham gia hoạt động:\n{url}"),
+                None => "Đường dẫn đăng ký này hiện không còn khả dụng. Bạn vui lòng mở bài viết gốc trên Facebook để kiểm tra lại thông tin chi tiết.".to_owned(),
             }))
         }
         InteractionCommand::Metrics => {
@@ -2185,7 +2181,7 @@ async fn build_interaction_reply(
                 return Ok(admin_only_reply());
             }
             Ok(simple_reply(
-                "Công cụ quản trị\n\n- /reviews: bài đang chờ duyệt\n- /pending: đề xuất nguồn đang chờ\n- /latest: bài thu thập gần đây\n- /feedbacks: toàn bộ feedback đã gửi\n- /crawl_history: lịch sử tất cả lần crawl\n- /crawl_run_ID: chi tiết một lần crawl\n- /portal_history: lịch sử crawl Portal\n- /metrics: kết quả 7 ngày\n\nDùng /portal_notice_ID để xem thông báo Portal và nhận tệp đính kèm nếu có. Các tin chi tiết khác sẽ cung cấp nút hoặc lệnh duyệt tương ứng."
+                "Công cụ quản trị\n\n- /report: xuất báo cáo vận hành hệ thống dạng tệp Markdown (.md)\n- /reviews: bài đang chờ duyệt\n- /pending: đề xuất nguồn đang chờ\n- /latest: bài thu thập gần đây\n- /feedbacks: toàn bộ feedback đã gửi\n- /crawl_history: lịch sử tất cả lần crawl\n- /crawl_run_ID: chi tiết một lần crawl\n- /portal_history: lịch sử crawl Portal\n- /metrics: kết quả tóm tắt 7 ngày\n\nDùng /portal_notice_ID để xem thông báo Portal và nhận tệp đính kèm nếu có. Các tin chi tiết khác sẽ cung cấp nút hoặc lệnh duyệt tương ứng."
                     .to_owned(),
             ))
         }
@@ -2206,7 +2202,7 @@ async fn build_interaction_reply(
             }
             let body = match store.crawl_history_item(run_id).await? {
                 Some(detail) => render_crawl_history_detail(&detail),
-                None => format!("KhÃ´ng tÃ¬m tháº¥y láº§n crawl #{run_id} trong lá»‹ch sá»­."),
+                None => format!("Không tìm thấy lần crawl #{run_id} trong lịch sử."),
             };
             Ok(simple_reply(body))
         }
@@ -2223,7 +2219,7 @@ async fn build_interaction_reply(
         InteractionCommand::PortalNotice(portal_id) => {
             let Some(mut notice) = store.portal_notice_history_item(portal_id).await? else {
                 return Ok(simple_reply(format!(
-                    "Không tìm thấy thông báo Portal #{portal_id} trong lịch sử crawl."
+                    "Không tìm thấy thông báo Portal #{portal_id} trong lịch sử thu thập."
                 )));
             };
             if notice.attachment_url.is_none()
@@ -2265,7 +2261,7 @@ async fn build_interaction_reply(
                 {
                     Ok(attachment) => reply.portal_document = Some(PortalDocumentReply { attachment }),
                     Err(error) => reply.user_text.push_str(&format!(
-                        "\n\nKhông tải được tệp đính kèm lúc này: {}",
+                        "\n\nTạm thời chưa tải được tệp đính kèm lúc này: {}",
                         error.to_string().chars().take(300).collect::<String>()
                     )),
                 }
@@ -2298,23 +2294,23 @@ async fn build_interaction_reply(
                 .begin_donation_amount_input(message.chat.id, expires_at)
                 .await?;
             Ok(simple_reply(
-                "Bạn muốn ủng hộ bao nhiêu? Hãy gửi số tiền từ 10.000 đến 10.000.000 VND. Ví dụ: 35000, 35.000 hoặc 35k. Gửi /cancel nếu bạn đổi ý."
+                "Bạn vui lòng gửi số tiền muốn ủng hộ trong khoảng từ 10.000 đến 10.000.000 VND (Ví dụ: 35000, 35.000 hoặc 35k). Bạn có thể gửi lệnh /cancel nếu muốn hủy thao tác."
                     .to_owned(),
             ))
         }
         InteractionCommand::InvalidDonationAmount => Ok(simple_reply(
-            "Số tiền chưa hợp lệ. Hãy nhập từ 10.000 đến 10.000.000 VND, ví dụ 35000, 35.000 hoặc 35k. Gửi /cancel nếu bạn đổi ý."
+            "Số tiền nhập vào chưa hợp lệ. Bạn vui lòng nhập số tiền từ 10.000 đến 10.000.000 VND (Ví dụ: 35000, 35.000 hoặc 35k). Bạn có thể gửi lệnh /cancel nếu muốn hủy thao tác."
                 .to_owned(),
         )),
         InteractionCommand::Cancel => {
             if store.clear_user_feedback_input(message.chat.id).await? {
-                Ok(simple_reply("Đã hủy gửi feedback.".to_owned()))
+                Ok(simple_reply("Đã hủy thao tác gửi phản hồi.".to_owned()))
             } else {
-                Ok(simple_reply("Đã hủy nhập số tiền ủng hộ.".to_owned()))
+                Ok(simple_reply("Đã hủy thao tác nhập số tiền ủng hộ.".to_owned()))
             }
         }
         InteractionCommand::DeclineDonation => Ok(simple_reply(
-            "Không sao cả. Bạn cứ dùng UTH Notifier bình thường nhé.".to_owned(),
+            "Cảm ơn bạn. Chúc bạn có những trải nghiệm học tập và rèn luyện thật tốt cùng UTH Notifier.".to_owned(),
         )),
         command @ InteractionCommand::DonateAmount(amount)
         | command @ InteractionCommand::CustomDonationAmount(amount) => {
@@ -2356,7 +2352,7 @@ async fn build_interaction_reply(
                 .await?;
             Ok(InteractionReply {
                 user_text: format!(
-                    "Quét QR để ủng hộ {}\n\nNgân hàng nhận: {}\nNgười nhận: {}\n{}\nNội dung chuyển khoản: {}\n\nMở trang thanh toán:\n{}\n\nQR có hiệu lực trong {} phút. Số tiền và nội dung đã được điền sẵn; bot sẽ tự động xác nhận khi giao dịch thành công.",
+                    "Mã QR ủng hộ kinh phí ({})\n\nNgân hàng thụ hưởng: {}\nTên người nhận: {}\n{}\nNội dung chuyển khoản: {}\n\nĐường dẫn cổng thanh toán trực tiếp:\n{}\n\nMã QR có hiệu lực trong {} phút. Số tiền và nội dung chuyển khoản đã được hệ thống cấu hình sẵn. Hệ thống sẽ tự động xác nhận ngay sau khi giao dịch thành công.",
                     format_vnd(payment.amount),
                     display_bank(&payment.bank_bin),
                     payment.account_name,
@@ -2381,9 +2377,9 @@ async fn build_interaction_reply(
             let subscriber = store.subscriber(message.chat.id).await?;
             let subscription = match subscriber {
                 Some(subscriber) if subscriber.active =>
-                    "Bạn đang nhận tin hoạt động và thông báo bắt buộc từ Portal UTH.".to_owned(),
-                Some(_) => "Bạn đang tắt tin hoạt động nhưng vẫn nhận thông báo bắt buộc từ Portal UTH. Chọn Bật thông báo khi muốn nhận lại tin hoạt động.".to_owned(),
-                None => "Bạn chưa thiết lập bot. Chọn Bật thông báo để bắt đầu.".to_owned(),
+                    "Trạng thái tài khoản: Bạn đang bật nhận thông báo hoạt động sinh viên và thông báo từ Cổng đào tạo UTH (Portal).".to_owned(),
+                Some(_) => "Trạng thái tài khoản: Bạn đang tạm dừng nhận tin hoạt động phong trào, nhưng vẫn nhận thông báo từ Cổng đào tạo UTH (Portal). Bạn có thể chọn Bật thông báo khi muốn nhận lại tin hoạt động.".to_owned(),
+                None => "Tài khoản của bạn chưa được kích hoạt nhận tin. Bạn vui lòng chọn Bật thông báo để bắt đầu.".to_owned(),
             };
             let health = store
                 .operational_health(
@@ -2402,7 +2398,7 @@ async fn build_interaction_reply(
                 .deactivate_subscriber(message.chat.id, USER_STOP_REASON)
                 .await?;
             Ok(simple_reply(
-                "Đã tắt thông báo hoạt động. Thông báo bắt buộc từ Portal UTH vẫn được gửi. Khi cần, bạn chỉ việc chọn Bật thông báo để nhận lại tin hoạt động.".to_owned(),
+                "Đã tạm dừng nhận thông báo hoạt động sinh viên. Xin lưu ý: Các thông báo quan trọng từ Cổng đào tạo UTH (Portal) vẫn sẽ được gửi đến bạn. Bất cứ khi nào cần nhận lại tin hoạt động, bạn chỉ việc chọn Bật thông báo để nhận lại tin.".to_owned(),
             ))
         }
         InteractionCommand::Pages(page) => {
@@ -2410,13 +2406,13 @@ async fn build_interaction_reply(
             Ok(simple_reply(render_source_page(&sources, page)))
         }
         InteractionCommand::Suggest(None) | InteractionCommand::Contact => Ok(simple_reply(
-            "Muốn đề xuất thêm trang, bạn gửi theo mẫu này:\n/suggest https://www.facebook.com/ten.trang\n\nQuản trị viên sẽ kiểm tra trước khi thêm."
+            "Để đề xuất thêm một trang Facebook công khai vào hệ thống theo dõi, bạn vui lòng gửi lệnh theo cú pháp:\n/suggest https://www.facebook.com/duong_dan_trang\n\nBan quản trị sẽ kiểm tra tính xác thực trước khi đưa vào danh sách theo dõi."
                 .to_owned(),
         )),
         InteractionCommand::Suggest(Some(value)) => {
             let Some(url) = normalize_facebook_page_url(&value) else {
                 return Ok(simple_reply(
-                    "Link này chưa đúng. Bạn hãy gửi link của một trang Facebook công khai."
+                    "Đường dẫn chưa hợp lệ. Bạn vui lòng cung cấp đường dẫn chính xác của một trang Facebook công khai."
                         .to_owned(),
                 ));
             };
@@ -2427,7 +2423,7 @@ async fn build_interaction_reply(
                 let sender = telegram_display_name(&message.chat)
                     .unwrap_or_else(|| format!("Người dùng {}", message.chat.id));
                 Ok(InteractionReply {
-                    user_text: "Mình đã nhận đề xuất. Quản trị viên sẽ kiểm tra trước khi thêm trang."
+                    user_text: "Hệ thống đã nhận được đề xuất của bạn. Ban quản trị sẽ kiểm tra và thêm trang vào danh sách theo dõi trong thời gian sớm nhất."
                         .to_owned(),
                     user_links: Vec::new(),
                     photo_png: None,
@@ -2447,7 +2443,7 @@ async fn build_interaction_reply(
                 })
             } else {
                 Ok(simple_reply(
-                    "Trang này đã được đề xuất và đang chờ quản trị viên xem xét.".to_owned(),
+                    "Trang này đã được người dùng khác đề xuất trước đó và hiện đang chờ ban quản trị xem xét.".to_owned(),
                 ))
             }
         }
@@ -2699,9 +2695,49 @@ async fn build_interaction_reply(
             };
             Ok(simple_reply(body))
         }
+        InteractionCommand::Events(page) => {
+            let page_size = 5_usize;
+            let offset = page.saturating_sub(1).saturating_mul(page_size);
+            let events = store
+                .active_events(
+                    i64::try_from(page_size + 1)?,
+                    i64::try_from(offset)?,
+                )
+                .await?;
+            Ok(simple_reply(render_active_events_page(
+                &events, page, page_size,
+            )))
+        }
+        InteractionCommand::Report => {
+            if Some(message.chat.id) != context.admin_chat_id {
+                return Ok(admin_only_reply());
+            }
+            let stats = store.system_report_stats().await?;
+            let growth = store.growth_metrics().await?;
+            let now = Utc::now();
+            let report_md = render_system_report_markdown(&stats, &growth, now);
+            let file_name = format!("UTH_Notifier_Report_{}.md", now.format("%Y%m%d_%H%M%S"));
+            let content_type = "text/markdown; charset=utf-8".to_owned();
+            let attachment = PortalAttachment {
+                bytes: report_md.into_bytes(),
+                file_name,
+                content_type,
+            };
+            let mut reply = simple_reply(format!(
+                "Báo cáo vận hành hệ thống UTH Notifier - Xuất lúc {}.\n\nTổng quan:\n- Sinh viên đăng ký: {} (Hoạt động: {})\n- Bài viết đã quét: {}\n- Thông báo đã phát: {}\n- Phản hồi hữu ích: {}\n\nChi tiết đầy đủ trong tệp Markdown đính kèm bên dưới.",
+                format_vietnam_datetime(&now.to_rfc3339()),
+                stats.total_subscribers,
+                stats.active_subscribers,
+                stats.total_posts,
+                stats.sent_deliveries,
+                growth.useful_feedback_7d
+            ));
+            reply.portal_document = Some(PortalDocumentReply { attachment });
+            Ok(reply)
+        }
         InteractionCommand::Usage(message) => Ok(simple_reply(message.to_owned())),
         InteractionCommand::Unknown => Ok(simple_reply(
-            "Mình chưa hiểu. Bạn chọn một nút bên dưới hoặc gửi /help nhé.".to_owned(),
+            "Yêu cầu chưa được nhận diện. Bạn vui lòng chọn các chức năng trên bàn phím bên dưới hoặc gửi /help để xem hướng dẫn chi tiết.".to_owned(),
         )),
     }
 }
@@ -2980,7 +3016,7 @@ fn render_portal_notice_history_page(
     page_size: usize,
 ) -> String {
     if notices.is_empty() {
-        return "Chưa có lịch sử crawl thông báo Portal.".to_owned();
+        return "Chưa có lịch sử thông báo từ Cổng đào tạo UTH.".to_owned();
     }
     let has_next = notices.len() > page_size;
     let entries = notices
@@ -3010,7 +3046,7 @@ fn render_portal_notice_history_page(
     } else {
         String::new()
     };
-    format!("Lịch sử crawl Portal - trang {requested_page}\n\n{entries}{navigation}")
+    format!("Lịch sử thông báo Cổng đào tạo UTH - Trang {requested_page}\n\n{entries}{navigation}")
 }
 
 fn render_portal_notice_history_detail(notice: &PortalNoticeHistoryRecord) -> String {
@@ -3026,7 +3062,7 @@ fn render_portal_notice_history_detail(notice: &PortalNoticeHistoryRecord) -> St
         "không có"
     };
     format!(
-        "THÔNG BÁO PORTAL #{}\nTiêu đề: {}\nNgày đăng: {}\nĐã crawl: {}\nTệp đính kèm: {}\nThông báo gốc: {}",
+        "THÔNG BÁO PORTAL #{} (Cổng đào tạo UTH)\nTiêu đề: {}\nNgày đăng: {}\nThời gian crawl: {}\nTệp đính kèm: {}\nThông báo gốc: {}",
         notice.portal_id,
         shorten_text(notice.title.trim(), 500),
         format_vietnam_datetime(&notice.displayed_at.to_rfc3339()),
@@ -3133,15 +3169,142 @@ fn shorten_text(value: &str, limit: usize) -> String {
     output
 }
 
+fn render_active_events_page(
+    events: &[ActiveEventRecord],
+    requested_page: usize,
+    page_size: usize,
+) -> String {
+    if events.is_empty() {
+        return "Hiện chưa có hoạt động hoặc học bổng nào trong 14 ngày qua.".to_owned();
+    }
+    let has_next = events.len() > page_size;
+    let entries = events
+        .iter()
+        .take(page_size)
+        .enumerate()
+        .map(|(index, event)| {
+            let number = (requested_page - 1) * page_size + index + 1;
+            let action = event
+                .action_url
+                .as_deref()
+                .map(|url| format!("\nLink đăng ký: {url}"))
+                .unwrap_or_default();
+            let post_url_line = event
+                .post_url
+                .as_deref()
+                .map(|url| format!("\nBài gốc: {url}"))
+                .unwrap_or_default();
+            format!(
+                "{}. {}\nNguồn: {}\nĐăng lúc: {}\n{}{}{}",
+                number,
+                shorten_text(
+                    event.text.lines().next().unwrap_or("Hoạt động UTH").trim(),
+                    80
+                ),
+                event.source_name,
+                format_vietnam_datetime(&event.published_at.to_rfc3339()),
+                shorten_text(event.text.trim(), 160),
+                action,
+                post_url_line
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let navigation = match (requested_page > 1, has_next) {
+        (true, true) => format!(
+            "\n\nTrang trước: /events_{}\nTrang sau: /events_{}",
+            requested_page - 1,
+            requested_page + 1
+        ),
+        (true, false) => format!("\n\nTrang trước: /events_{}", requested_page - 1),
+        (false, true) => format!("\n\nTrang sau: /events_{}", requested_page + 1),
+        (false, false) => String::new(),
+    };
+    format!(
+        "Hoạt động & Học bổng đang mở (14 ngày qua) - Trang {requested_page}\n\n{entries}{navigation}"
+    )
+}
+
+fn render_system_report_markdown(
+    stats: &SystemReportStats,
+    growth: &GrowthMetrics,
+    now: DateTime<Utc>,
+) -> String {
+    let latest_post_str = stats
+        .latest_post_at
+        .map(|dt| format_vietnam_datetime(&dt.to_rfc3339()))
+        .unwrap_or_else(|| "Chưa có".to_owned());
+    format!(
+        "# BÁO CÁO VẬN HÀNH HỆ THỐNG UTH NOTIFIER\n\
+         Thời gian xuất báo cáo: {}\n\n\
+         ## 1. Người dùng & Đăng ký\n\
+         - Tổng số người đăng ký: {}\n\
+         - Đang hoạt động (active): {}\n\
+         - Chế độ nhận: {} nhận ngay (instant), {} bản tin sáng (daily)\n\
+         - Phạm vi nhận tin: {} chỉ ĐRL, {} toàn bộ hoạt động\n\
+         - Tăng trưởng 7 ngày qua: {} lượt bắt đầu dùng bot, {} hoàn tất cài đặt\n\n\
+         ## 2. Nguồn dữ liệu & Thu thập\n\
+         - Tổng nguồn theo dõi: {} ({} đang bật)\n\
+         - Tổng bài viết Facebook đã thu thập: {}\n\
+         - Bài viết mới nhất: {}\n\
+         - Thông báo Portal UTH đã lưu: {}\n\n\
+         ## 3. Phân loại bài viết & Học máy AI\n\
+         - Tổng lượt phân loại: {}\n\
+         - Tự động duyệt (matched_explicit): {}\n\
+         - Chờ duyệt thủ công (manual_review): {}\n\
+         - Từ chối tự động (rejected): {}\n\
+         - Mẫu học tập phản hồi AI (ai_review_learning_examples): {}\n\n\
+         ## 4. Phân phối thông báo & Tương tác người dùng\n\
+         - Tổng chiến dịch đã tạo (campaigns): {}\n\
+         - Tổng lượt gửi thông báo (deliveries): {} (Gửi thành công: {})\n\
+         - Thông báo gửi trong 7 ngày qua: {}\n\
+         - Lượt mở link đăng ký (CTA) trong 7 ngày qua: {}\n\
+         - Phản hồi sinh viên (7 ngày qua): {} hữu ích, {} không phù hợp\n\n\
+         ## 5. Kinh phí & Quyên góp cộng đồng\n\
+         - Lượt ủng hộ thành công (7 ngày qua): {}\n\
+         - Tổng số tiền ủng hộ (7 ngày qua): {}\n\n\
+         ---\n\
+         *Báo cáo được khởi tạo tự động bởi UTH Notifier Core Agent.*",
+        format_vietnam_datetime(&now.to_rfc3339()),
+        stats.total_subscribers,
+        stats.active_subscribers,
+        stats.instant_mode,
+        stats.daily_mode,
+        stats.scope_drl,
+        stats.scope_all,
+        growth.starts_7d,
+        growth.onboarding_completed_7d,
+        stats.total_sources,
+        stats.active_sources,
+        stats.total_posts,
+        latest_post_str,
+        stats.portal_notices,
+        stats.total_classifications,
+        stats.matched_explicit_classifications,
+        stats.manual_review_classifications,
+        stats.rejected_classifications,
+        stats.ai_learning_examples,
+        stats.total_campaigns,
+        stats.total_deliveries,
+        stats.sent_deliveries,
+        growth.notifications_delivered_7d,
+        growth.cta_clicks_7d,
+        growth.useful_feedback_7d,
+        growth.irrelevant_feedback_7d,
+        growth.donations_paid_7d,
+        format_vnd(growth.donation_amount_7d),
+    )
+}
+
 fn render_help(is_admin: bool) -> String {
-    let public_history = "\n\nLịch sử công khai:\n- /latest: xem các bài Facebook mới thu thập.\n- /portal_history: xem thông báo Portal đã crawl.\n- /portal_notice_ID: mở một thông báo Portal và nhận tệp đính kèm nếu có.";
+    let public_history = "\n\nCác lệnh chính:\n- /events: xem hoạt động và học bổng đang mở (14 ngày qua).\n- /portal: xem thông báo mới từ Cổng thông tin Đào tạo UTH.\n- /settings: cài đặt cách nhận và phạm vi thông báo.\n- /donate: ủng hộ kinh phí duy trì máy chủ bot.\n- /help: mở lại hướng dẫn này.\n- /latest: xem các bài viết Facebook mới thu thập.";
     let admin = if is_admin {
-        "\n\nBạn là quản trị viên. Chọn /admin để mở các công cụ quản trị."
+        "\n\nBạn là quản trị viên. Chọn /admin để mở các công cụ quản trị hoặc /report để xuất file báo cáo vận hành (.md)."
     } else {
         ""
     };
     with_support_group(&format!(
-        "UTH Notifier báo cho bạn khi tìm thấy hoạt động phù hợp từ các trang công khai đang theo dõi. Bot cũng gửi mọi thông báo mới từ Portal UTH và gửi kèm tệp khi Portal có đính kèm. Tin Portal là bắt buộc, không phụ thuộc loại hoạt động, cách nhận, giờ yên lặng hoặc trạng thái tạm dừng.\n\nTrong Cài đặt:\n- Loại hoạt động: chỉ tin có điểm rèn luyện hoặc mọi hoạt động phù hợp.\n- Nhận ngay: bot gửi từng tin khi phát hiện.\n- Bản tin lúc 07:30: bot gom tin mới và gửi một lần mỗi ngày. Ngày không có tin phù hợp, bot sẽ không gửi.\n- Giờ yên lặng: nếu bật, tin hoạt động cần gửi ngay từ 22:00 đến 07:00 sẽ được giữ lại đến sau 07:00.\n- Tạm dừng tin hoạt động: ngừng nhận tin hoạt động cho tới khi bạn bật lại.\n- Xem một tin mẫu: xem trước dạng thông báo hoạt động bot sẽ gửi.\n\nCác nút chính:\n- Trang đang theo dõi: xem các nguồn bot đang kiểm tra.\n- Đề xuất trang: gửi link Facebook công khai để quản trị viên xem xét.\n- Gửi phản hồi: gửi góp ý trực tiếp cho quản trị viên.\n- Cài đặt: xem và thay đổi cách nhận thông báo hoạt động.\n- Trợ giúp: mở lại hướng dẫn này.\n- Ủng hộ: chủ động hỗ trợ chi phí vận hành; việc ủng hộ hoàn toàn tự nguyện và không ảnh hưởng quyền dùng bot.{public_history}{admin}"
+        "UTH Notifier là hệ thống thông báo tự động dành cho sinh viên Trường Đại học Giao thông vận tải TP.HCM (UTH). Hệ thống tự động theo dõi các trang tin công khai để cập nhật hoạt động phong trào, cơ hội nhận điểm rèn luyện, học bổng, đồng thời chuyển tiếp trực tiếp các thông báo từ Cổng đào tạo UTH (Portal) kèm tệp đính kèm nếu có.\n\nThông báo từ Cổng đào tạo UTH là thông tin quan trọng nên luôn được gửi trực tiếp, không phụ thuộc vào loại hoạt động, cách nhận, giờ yên lặng hoặc trạng thái tạm dừng.\n\nTrong Cài đặt:\n- Loại hoạt động: chỉ tin có điểm rèn luyện hoặc mọi hoạt động phù hợp.\n- Nhận ngay: bot gửi từng tin khi phát hiện.\n- Bản tin lúc 07:30: bot gom tin mới và gửi một lần mỗi ngày. Ngày không có tin phù hợp, bot sẽ không gửi.\n- Giờ yên lặng: nếu bật, tin hoạt động cần gửi ngay từ 22:00 đến 07:00 sẽ được giữ lại đến sau 07:00 sáng hôm sau.\n- Tạm dừng tin hoạt động: ngừng nhận tin hoạt động cho tới khi bạn bật lại.\n- Xem một tin mẫu: xem trước dạng thông báo hoạt động bot sẽ gửi.\n\nCác nút chính:\n- Hoạt động: xem các hoạt động và học bổng đang mở (14 ngày qua).\n- Cổng đào tạo: xem thông báo mới từ Cổng thông tin Đào tạo UTH.\n- Cài đặt: xem và thay đổi cách nhận thông báo hoạt động.\n- Trang theo dõi: xem các nguồn bot đang kiểm tra.\n- Trợ giúp: mở lại hướng dẫn này.\n- Ủng hộ: chủ động hỗ trợ chi phí vận hành; việc ủng hộ hoàn toàn tự nguyện và không ảnh hưởng quyền dùng bot.{public_history}{admin}"
     ))
 }
 
@@ -3228,6 +3391,8 @@ enum InteractionCommand {
     },
     Latest(usize),
     LatestPost(i64),
+    Events(usize),
+    Report,
     Usage(&'static str),
     Unknown,
 }
@@ -3277,12 +3442,15 @@ fn parse_interaction_command(text: &str) -> InteractionCommand {
         "trợ giúp" => InteractionCommand::Help,
         "trạng thái" => InteractionCommand::Status,
         "tắt thông báo" => InteractionCommand::Stop,
-        "trang đang theo dõi" => InteractionCommand::Pages(1),
+        "trang theo dõi" | "trang đang theo dõi" => InteractionCommand::Pages(1),
         "đề xuất trang" => InteractionCommand::Suggest(None),
         "liên hệ quản trị" => InteractionCommand::Contact,
         "gửi phản hồi" => InteractionCommand::UserFeedbackPrompt,
         "ủng hộ" => InteractionCommand::Donate,
         "cài đặt" => InteractionCommand::Settings,
+        "hoạt động" | "sự kiện" | "events" | "active" => InteractionCommand::Events(1),
+        "báo cáo" | "report" => InteractionCommand::Report,
+        "cổng đào tạo" | "portal" => InteractionCommand::PortalHistory(1),
         "10.000 vnd" => InteractionCommand::DonateAmount(10_000),
         "20.000 vnd" => InteractionCommand::DonateAmount(20_000),
         "50.000 vnd" => InteractionCommand::DonateAmount(50_000),
@@ -3362,7 +3530,7 @@ fn parse_interaction_command(text: &str) -> InteractionCommand {
                 .unwrap_or(InteractionCommand::Usage(
                     "Mã lần crawl không hợp lệ. Hãy dùng /crawl_history.",
                 )),
-            "/portal_history" => InteractionCommand::PortalHistory(
+            "/portal" | "/portal_history" => InteractionCommand::PortalHistory(
                 parts
                     .next()
                     .and_then(|value| value.parse::<usize>().ok())
@@ -3384,6 +3552,15 @@ fn parse_interaction_command(text: &str) -> InteractionCommand {
                     .filter(|page| *page > 0)
                     .unwrap_or(1),
             ),
+            value if value.starts_with("/portal_") && !value.starts_with("/portal_notice_") => {
+                InteractionCommand::PortalHistory(
+                    value
+                        .strip_prefix("/portal_")
+                        .and_then(|page| page.parse::<usize>().ok())
+                        .filter(|page| *page > 0)
+                        .unwrap_or(1),
+                )
+            }
             value if value.starts_with("/portal_notice_") => value
                 .strip_prefix("/portal_notice_")
                 .and_then(|id| id.parse::<i64>().ok())
@@ -3392,6 +3569,28 @@ fn parse_interaction_command(text: &str) -> InteractionCommand {
                 .unwrap_or(InteractionCommand::Usage(
                     "Mã Portal không hợp lệ. Hãy dùng /portal_notice_ID.",
                 )),
+            "/events" | "/active" => InteractionCommand::Events(
+                parts
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|page| *page > 0)
+                    .unwrap_or(1),
+            ),
+            value if value.starts_with("/events_") => InteractionCommand::Events(
+                value
+                    .strip_prefix("/events_")
+                    .and_then(|page| page.parse::<usize>().ok())
+                    .filter(|page| *page > 0)
+                    .unwrap_or(1),
+            ),
+            value if value.starts_with("/active_") => InteractionCommand::Events(
+                value
+                    .strip_prefix("/active_")
+                    .and_then(|page| page.parse::<usize>().ok())
+                    .filter(|page| *page > 0)
+                    .unwrap_or(1),
+            ),
+            "/report" => InteractionCommand::Report,
             "/admin" => InteractionCommand::Admin,
             "/help" => InteractionCommand::Help,
             "/status" => InteractionCommand::Status,
@@ -3790,15 +3989,7 @@ async fn plan_event(
     event: ClaimedNotificationEvent,
     args: &NotifyArgs,
 ) -> PlanReport {
-    let result = plan_event_inner(
-        store,
-        telegram,
-        gemini,
-        owner,
-        &event,
-        args.admin_chat_id,
-    )
-    .await;
+    let result = plan_event_inner(store, telegram, gemini, owner, &event, args.admin_chat_id).await;
     match result {
         Ok(outcome) => PlanReport {
             event_key: event.event_key,
@@ -3852,7 +4043,8 @@ async fn plan_event_inner(
                 )
                 .await?;
             let source_name = store.source_name_for_post(payload.database_post_id).await?;
-            post_url = Some(delivery_post_url(&post));
+            let current_post_url = delivery_post_url(&post);
+            post_url = Some(current_post_url.clone());
             action_url = payload
                 .classification
                 .extracted
@@ -3861,11 +4053,85 @@ async fn plan_event_inner(
                 .and_then(|links| links.first())
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
-            Some(render_structured_notification(
-                &post,
-                &payload.classification,
-                &source_name,
-            ))
+
+            if let Some(gemini_client) = gemini {
+                let examples = store
+                    .latest_ai_learning_examples(5)
+                    .await
+                    .unwrap_or_default();
+                match gemini_client
+                    .review_post(
+                        &source_name,
+                        &post.text,
+                        &current_post_url,
+                        &post.published_at,
+                        None,
+                        &examples,
+                    )
+                    .await
+                {
+                    Ok(gemini_output) => match gemini_output.decision {
+                        GeminiReviewDecision::Send => {
+                            if let Some(admin_chat_id) = admin_chat_id {
+                                let _ = store
+                                    .record_classification_review_resolution(
+                                        payload.database_classification_id,
+                                        admin_chat_id,
+                                        ManualReviewAction::Send,
+                                        Some(&format!("[Gemini AI] {}", gemini_output.reason)),
+                                    )
+                                    .await;
+                                let admin_msg = format!(
+                                    "GEMINI AI: BÀI ĐÃ DUYỆT #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu duyệt sai, bấm: /ai_reject_{}",
+                                    payload.database_classification_id,
+                                    source_name,
+                                    format_vietnam_datetime(&post.published_at),
+                                    gemini_output.reason,
+                                    gemini_output.confidence * 100.0,
+                                    shorten_chars(&post.text, 500),
+                                    current_post_url,
+                                    payload.database_classification_id
+                                );
+                                let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                            }
+                            Some(render_notification(&post))
+                        }
+                        GeminiReviewDecision::Skip => {
+                            if let Some(admin_chat_id) = admin_chat_id {
+                                let _ = store
+                                    .record_classification_review_resolution(
+                                        payload.database_classification_id,
+                                        admin_chat_id,
+                                        ManualReviewAction::Skip,
+                                        Some(&format!("[Gemini AI] {}", gemini_output.reason)),
+                                    )
+                                    .await;
+                                let admin_msg = format!(
+                                    "GEMINI AI: BÀI ĐÃ BỎ QUA #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
+                                    payload.database_classification_id,
+                                    source_name,
+                                    format_vietnam_datetime(&post.published_at),
+                                    gemini_output.reason,
+                                    gemini_output.confidence * 100.0,
+                                    shorten_chars(&post.text, 500),
+                                    current_post_url,
+                                    payload.database_classification_id
+                                );
+                                let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                            }
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!(
+                            "Gemini review error for matched_explicit, fallback to auto-send: {err:#}"
+                        );
+                        Some(render_notification(&post))
+                    }
+                }
+            } else {
+                Some(render_notification(&post))
+            }
         }
         ClassificationDecision::ManualReview => {
             let inherited = store
@@ -3879,72 +4145,82 @@ async fn plan_event_inner(
             {
                 let mut resolved_by_gemini = false;
                 if let Some(gemini_client) = gemini {
-                    let examples = store.latest_ai_learning_examples(5).await.unwrap_or_default();
+                    let examples = store
+                        .latest_ai_learning_examples(5)
+                        .await
+                        .unwrap_or_default();
                     let review_url = delivery_post_url(&review.post);
                     match gemini_client
-                        .review_post(&review.source_name, &review.post.text, &review_url, &examples)
+                        .review_post(
+                            &review.source_name,
+                            &review.post.text,
+                            &review_url,
+                            &review.post.published_at,
+                            None,
+                            &examples,
+                        )
                         .await
                     {
-                        Ok(gemini_output) => {
-                            match gemini_output.decision {
-                                GeminiReviewDecision::Send => {
-                                    let notif_text = render_notification(&review.post);
-                                    let outcome = store
-                                        .resolve_manual_review(
-                                            payload.database_classification_id,
-                                            admin_chat_id,
-                                            admin_chat_id,
-                                            ManualReviewAction::Send,
-                                            Some(&format!("[Gemini AI] {}", gemini_output.reason)),
-                                            Some(ManualReviewNotification {
-                                                message_text: &notif_text,
-                                                post_url: &review_url,
-                                            }),
-                                        )
-                                        .await?;
-                                    if outcome.resolved {
-                                        resolved_by_gemini = true;
-                                        let admin_msg = format!(
-                                            "BÀI ĐÃ TỰ ĐỘNG DUYỆT BỞI GEMINI #{}\nNguồn: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\n{}\n\nNếu duyệt sai, bấm: /ai_reject_{}",
-                                            payload.database_classification_id,
-                                            review.source_name,
-                                            gemini_output.reason,
-                                            gemini_output.confidence * 100.0,
-                                            shorten_chars(&review.post.text, 500),
-                                            review_url,
-                                            payload.database_classification_id
-                                        );
-                                        let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
-                                    }
-                                }
-                                GeminiReviewDecision::Skip => {
-                                    let outcome = store
-                                        .resolve_manual_review(
-                                            payload.database_classification_id,
-                                            admin_chat_id,
-                                            admin_chat_id,
-                                            ManualReviewAction::Skip,
-                                            Some(&format!("[Gemini AI] {}", gemini_output.reason)),
-                                            None,
-                                        )
-                                        .await?;
-                                    if outcome.resolved {
-                                        resolved_by_gemini = true;
-                                        let admin_msg = format!(
-                                            "BÀI ĐÃ BỎ QUA BỞI GEMINI #{}\nNguồn: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\n{}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
-                                            payload.database_classification_id,
-                                            review.source_name,
-                                            gemini_output.reason,
-                                            gemini_output.confidence * 100.0,
-                                            shorten_chars(&review.post.text, 500),
-                                            review_url,
-                                            payload.database_classification_id
-                                        );
-                                        let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
-                                    }
+                        Ok(gemini_output) => match gemini_output.decision {
+                            GeminiReviewDecision::Send => {
+                                let notif_text = render_notification(&review.post);
+                                let outcome = store
+                                    .resolve_manual_review(
+                                        payload.database_classification_id,
+                                        admin_chat_id,
+                                        admin_chat_id,
+                                        ManualReviewAction::Send,
+                                        Some(&format!("[Gemini AI] {}", gemini_output.reason)),
+                                        Some(ManualReviewNotification {
+                                            message_text: &notif_text,
+                                            post_url: &review_url,
+                                        }),
+                                    )
+                                    .await?;
+                                if outcome.resolved {
+                                    resolved_by_gemini = true;
+                                    let admin_msg = format!(
+                                        "GEMINI AI: BÀI ĐÃ DUYỆT #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu duyệt sai, bấm: /ai_reject_{}",
+                                        payload.database_classification_id,
+                                        review.source_name,
+                                        format_vietnam_datetime(&review.post.published_at),
+                                        gemini_output.reason,
+                                        gemini_output.confidence * 100.0,
+                                        shorten_chars(&review.post.text, 500),
+                                        review_url,
+                                        payload.database_classification_id
+                                    );
+                                    let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
                                 }
                             }
-                        }
+                            GeminiReviewDecision::Skip => {
+                                let outcome = store
+                                    .resolve_manual_review(
+                                        payload.database_classification_id,
+                                        admin_chat_id,
+                                        admin_chat_id,
+                                        ManualReviewAction::Skip,
+                                        Some(&format!("[Gemini AI] {}", gemini_output.reason)),
+                                        None,
+                                    )
+                                    .await?;
+                                if outcome.resolved {
+                                    resolved_by_gemini = true;
+                                    let admin_msg = format!(
+                                        "GEMINI AI: BÀI ĐÃ BỎ QUA #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
+                                        payload.database_classification_id,
+                                        review.source_name,
+                                        format_vietnam_datetime(&review.post.published_at),
+                                        gemini_output.reason,
+                                        gemini_output.confidence * 100.0,
+                                        shorten_chars(&review.post.text, 500),
+                                        review_url,
+                                        payload.database_classification_id
+                                    );
+                                    let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                                }
+                            }
+                        },
                         Err(err) => {
                             eprintln!("Gemini review error, fallback to manual review: {err:#}");
                         }
@@ -3957,7 +4233,9 @@ async fn plan_event_inner(
                     {
                         TelegramSendOutcome::Sent { .. } => {}
                         TelegramSendOutcome::RetryAfter { seconds, detail } => {
-                            bail!("Telegram yêu cầu chờ {seconds} giây khi báo bài cần duyệt: {detail}")
+                            bail!(
+                                "Telegram yêu cầu chờ {seconds} giây khi báo bài cần duyệt: {detail}"
+                            )
                         }
                         TelegramSendOutcome::ChatMigrated { detail, .. }
                         | TelegramSendOutcome::PermanentFailure { detail, .. }
@@ -4229,7 +4507,7 @@ fn render_donation(config: &DonationConfig, payos_enabled: bool) -> String {
             .map(|value| format!("\n\n{value}"))
             .unwrap_or_default();
         return format!(
-            "Nếu UTH Notifier hữu ích với bạn, bạn có thể chọn một mức gợi ý hoặc chọn Tùy tâm để nhập số tiền phù hợp.{message}\n\nBot sẽ gửi QR payOS đã điền sẵn số tiền và nội dung chuyển khoản, rồi tự động xác nhận giao dịch.\n\nViệc ủng hộ hoàn toàn tự nguyện và không ảnh hưởng quyền dùng bot."
+            "Nếu UTH Notifier mang lại sự tiện ích cho bạn, bạn có thể chọn một mức gợi ý bên dưới hoặc chọn Tùy tâm để nhập số tiền phù hợp.{message}\n\nBot sẽ gửi mã QR payOS đã điền sẵn số tiền và nội dung chuyển khoản, rồi tự động xác nhận giao dịch.\n\nViệc ủng hộ hoàn toàn tự nguyện và không ảnh hưởng quyền dùng bot."
         );
     }
     let Some(vietqr_url) = config.vietqr_url.as_deref() else {
@@ -4241,7 +4519,7 @@ fn render_donation(config: &DonationConfig, payos_enabled: bool) -> String {
         .map(|value| format!("\n\n{value}"))
         .unwrap_or_default();
     format!(
-        "Ủng hộ chi phí vận hành UTH Notifier\n\nMở hoặc quét mã VietQR:\n{vietqr_url}{message}\n\nĐây là khoản ủng hộ tự nguyện. Bot không tự động xác nhận giao dịch."
+        "Ủng hộ kinh phí vận hành UTH Notifier\n\nMở hoặc quét mã VietQR:\n{vietqr_url}{message}\n\nĐây là khoản ủng hộ tự nguyện. Bot không tự động xác nhận giao dịch."
     )
 }
 
@@ -4333,7 +4611,7 @@ async fn run_payos_payment_cycle(store: &CrawlStore, telegram: &TelegramClient) 
             .send_message(
                 outcome.telegram_chat_id,
                 &format!(
-                    "Đã nhận khoản ủng hộ.\n\nSố tiền: {}\nNội dung: {}\nMã giao dịch: {}\nThời gian: {}\n\nCảm ơn bạn đã hỗ trợ chi phí vận hành UTH Notifier.",
+                    "Xác nhận nhận ủng hộ thành công!\n\nSố tiền: {}\nNội dung: {}\nMã giao dịch: {}\nThời gian: {}\n\nChân thành cảm ơn bạn đã hỗ trợ chi phí vận hành UTH Notifier.",
                     format_vnd(payload.amount),
                     payload.description,
                     payload.reference,
@@ -4433,20 +4711,21 @@ fn render_operational_alert(kind: OperationalAlertKind, health: &OperationalHeal
 mod tests {
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use uth_storage::{
-        CrawlAttemptHistoryRecord, CrawlHistoryDetail, CrawlHistoryRecord, OperationalHealth,
-        PortalNoticeHistoryRecord, PortalPollState, SourceRecord, UserFeedbackHistoryRecord,
+        ActiveEventRecord, CrawlAttemptHistoryRecord, CrawlHistoryDetail, CrawlHistoryRecord,
+        GrowthMetrics, OperationalAlertKind, OperationalHealth, PortalNoticeHistoryRecord,
+        PortalPollState, SourceRecord, SystemReportStats, UserFeedbackHistoryRecord,
     };
 
     use super::{
         DonationConfig, InteractionCommand, PortalCycleReport, PortalPollConfig,
         SUPPORT_GROUP_INVITATION, display_bank, next_portal_poll_state,
         normalize_facebook_page_url, parse_donation_amount, parse_interaction_command,
-        render_crawl_history_detail, render_crawl_history_page, render_donation, render_help,
-        render_operational_alert, render_operational_health, render_payment_account,
-        render_portal_notice_history_detail, render_portal_notice_history_page, render_source_page,
+        render_active_events_page, render_crawl_history_detail, render_crawl_history_page,
+        render_donation, render_help, render_operational_alert, render_operational_health,
+        render_payment_account, render_portal_notice_history_detail,
+        render_portal_notice_history_page, render_source_page, render_system_report_markdown,
         render_user_feedback_page, retry_delay_seconds, should_archive_as_stale_portal_notice,
     };
-    use uth_storage::OperationalAlertKind;
 
     #[test]
     fn retry_delay_is_bounded() {
@@ -4659,6 +4938,18 @@ mod tests {
             InteractionCommand::Pages(1)
         );
         assert_eq!(
+            parse_interaction_command("Trang theo dõi"),
+            InteractionCommand::Pages(1)
+        );
+        assert_eq!(
+            parse_interaction_command("Hoạt động"),
+            InteractionCommand::Events(1)
+        );
+        assert_eq!(
+            parse_interaction_command("Cổng đào tạo"),
+            InteractionCommand::PortalHistory(1)
+        );
+        assert_eq!(
             parse_interaction_command("Ủng hộ"),
             InteractionCommand::Donate
         );
@@ -4738,12 +5029,36 @@ mod tests {
             InteractionCommand::Reviews(2)
         );
         assert_eq!(
+            parse_interaction_command("/portal"),
+            InteractionCommand::PortalHistory(1)
+        );
+        assert_eq!(
+            parse_interaction_command("/portal_2"),
+            InteractionCommand::PortalHistory(2)
+        );
+        assert_eq!(
             parse_interaction_command("/portal_history"),
             InteractionCommand::PortalHistory(1)
         );
         assert_eq!(
             parse_interaction_command("/portal_history_2"),
             InteractionCommand::PortalHistory(2)
+        );
+        assert_eq!(
+            parse_interaction_command("/events"),
+            InteractionCommand::Events(1)
+        );
+        assert_eq!(
+            parse_interaction_command("/events_3"),
+            InteractionCommand::Events(3)
+        );
+        assert_eq!(
+            parse_interaction_command("/active"),
+            InteractionCommand::Events(1)
+        );
+        assert_eq!(
+            parse_interaction_command("/report"),
+            InteractionCommand::Report
         );
         assert_eq!(
             parse_interaction_command("/crawl_history"),
@@ -4934,8 +5249,10 @@ mod tests {
         assert!(!user.contains("campaign"));
         assert!(!user.contains("/admin"));
         assert!(user.contains("/latest"));
-        assert!(user.contains("/portal_history"));
-        assert!(user.contains("Gửi phản hồi"));
+        assert!(user.contains("/portal"));
+        assert!(user.contains("/events"));
+        assert!(user.contains("/donate"));
+        assert!(user.contains("Trang theo dõi"));
 
         let admin = render_help(true);
         assert!(admin.contains("/admin"));
@@ -5101,5 +5418,80 @@ mod tests {
             }
             other => panic!("expected AiApprove with reason, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn renders_active_events_page_content_and_navigation() {
+        let empty = render_active_events_page(&[], 1, 5);
+        assert!(empty.contains("Hiện chưa có hoạt động hoặc học bổng nào trong 14 ngày qua."));
+
+        let events = vec![
+            ActiveEventRecord {
+                campaign_id: 1,
+                post_id: 10,
+                source_name: "Đoàn Trường UTH".to_owned(),
+                post_url: Some("https://facebook.com/post/1".to_owned()),
+                action_url: Some("https://forms.gle/test".to_owned()),
+                published_at: Utc::now(),
+                text: "Hội thảo Nghiên cứu Khoa học 2026\nChi tiết bài viết".to_owned(),
+            },
+            ActiveEventRecord {
+                campaign_id: 2,
+                post_id: 11,
+                source_name: "Hội Sinh viên UTH".to_owned(),
+                post_url: None,
+                action_url: None,
+                published_at: Utc::now(),
+                text: "Ngày hội Việc làm UTH 2026".to_owned(),
+            },
+        ];
+        let page = render_active_events_page(&events, 1, 1);
+        assert!(page.contains("Hội thảo Nghiên cứu Khoa học"));
+        assert!(page.contains("Link đăng ký: https://forms.gle/test"));
+        assert!(page.contains("Bài gốc: https://facebook.com/post/1"));
+        assert!(page.contains("/events_2"));
+    }
+
+    #[test]
+    fn renders_system_report_markdown_structure() {
+        let stats = SystemReportStats {
+            total_subscribers: 100,
+            active_subscribers: 85,
+            instant_mode: 70,
+            daily_mode: 15,
+            scope_all: 60,
+            scope_drl: 25,
+            total_sources: 12,
+            active_sources: 10,
+            total_posts: 1500,
+            latest_post_at: Some(Utc::now()),
+            total_classifications: 1400,
+            rejected_classifications: 1100,
+            manual_review_classifications: 150,
+            matched_explicit_classifications: 150,
+            total_campaigns: 140,
+            total_deliveries: 5000,
+            sent_deliveries: 4950,
+            portal_notices: 28,
+            ai_learning_examples: 7,
+        };
+        let growth = GrowthMetrics {
+            starts_7d: 20,
+            onboarding_completed_7d: 18,
+            active_subscribers: 85,
+            notifications_delivered_7d: 450,
+            cta_clicks_7d: 120,
+            useful_feedback_7d: 35,
+            irrelevant_feedback_7d: 2,
+            donations_paid_7d: 3,
+            donation_amount_7d: 150_000,
+        };
+        let md = render_system_report_markdown(&stats, &growth, Utc::now());
+        assert!(md.contains("# BÁO CÁO VẬN HÀNH HỆ THỐNG UTH NOTIFIER"));
+        assert!(md.contains("Tổng số người đăng ký: 100"));
+        assert!(md.contains("Đang hoạt động (active): 85"));
+        assert!(md.contains("Tổng bài viết Facebook đã thu thập: 1500"));
+        assert!(md.contains("Mẫu học tập phản hồi AI (ai_review_learning_examples): 7"));
+        assert!(md.contains("Tổng số tiền ủng hộ (7 ngày qua): 150.000 VND"));
     }
 }

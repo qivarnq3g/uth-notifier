@@ -1,12 +1,10 @@
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, FixedOffset};
 use reqwest::{StatusCode, redirect};
 use serde::{Deserialize, Serialize};
 use url::Url;
-use uth_domain::{
-    ClassificationResult, FacebookPost, TELEGRAM_MESSAGE_LIMIT, TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT,
-};
+use uth_domain::{FacebookPost, TELEGRAM_MESSAGE_LIMIT, TELEGRAM_MESSAGE_UTF8_BYTE_LIMIT};
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const TELEGRAM_RESPONSE_LIMIT: u64 = 65_536;
@@ -786,7 +784,7 @@ impl TelegramClient {
 }
 
 pub fn render_notification(post: &FacebookPost) -> String {
-    let header = "Hoạt động sinh viên mới\n\n";
+    let header = "Thông báo hoạt động sinh viên UTH\n\n";
     let post_url = delivery_post_url(post);
     let footer = format!(
         "\n\nĐăng lúc: {}\nBài gốc: {}",
@@ -848,56 +846,6 @@ fn is_facebook_post_locator(value: &str) -> bool {
                     .all(|character| character.is_ascii_alphanumeric())))
 }
 
-pub fn render_structured_notification(
-    post: &FacebookPost,
-    classification: &ClassificationResult,
-    source_name: &str,
-) -> String {
-    let normalized_lines = post
-        .text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let title = normalized_lines
-        .first()
-        .copied()
-        .map(|value| truncate_chars(value, 140))
-        .unwrap_or_else(|| "Hoạt động sinh viên mới".to_owned());
-    let dates = classification
-        .extracted
-        .get("dates")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|date| date.get("date").and_then(serde_json::Value::as_str))
-        .map(format_user_date)
-        .take(2)
-        .collect::<Vec<_>>();
-    let mut facts = vec![format!("Nguồn: {source_name}")];
-    if classification.features.explicit_drl {
-        facts.push("Quyền lợi: Có nhắc tới điểm rèn luyện".to_owned());
-    }
-    if !dates.is_empty() {
-        facts.push(format!("Ngày diễn ra hoặc hết hạn: {}", dates.join(", ")));
-    }
-    if classification.features.form_link {
-        facts.push("Có biểu mẫu đăng ký".to_owned());
-    }
-    let body = normalized_lines
-        .iter()
-        .skip(1)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let summary = truncate_chars(body.trim(), 900);
-    if summary.is_empty() {
-        format!("{title}\n\n{}", facts.join("\n"))
-    } else {
-        format!("{title}\n\n{}\n\n{summary}", facts.join("\n"))
-    }
-}
-
 pub fn humanize_notification_sample(message: &str) -> String {
     message
         .lines()
@@ -914,12 +862,6 @@ pub fn humanize_notification_sample(message: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn format_user_date(value: &str) -> String {
-    NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map(|date| date.format("%d/%m/%Y").to_string())
-        .unwrap_or_else(|_| value.to_owned())
 }
 
 fn format_vietnam_datetime(value: &str) -> String {
@@ -1214,24 +1156,26 @@ fn command_keyboard() -> ReplyKeyboardMarkup {
         keyboard: vec![
             vec![
                 KeyboardButton {
-                    text: "Cài đặt"
+                    text: "Hoạt động"
                 },
                 KeyboardButton {
-                    text: "Trang đang theo dõi",
+                    text: "Cổng đào tạo",
                 },
             ],
             vec![
                 KeyboardButton {
-                    text: "Đề xuất trang",
+                    text: "Cài đặt"
                 },
+                KeyboardButton {
+                    text: "Trang theo dõi",
+                },
+            ],
+            vec![
                 KeyboardButton {
                     text: "Trợ giúp"
                 },
+                KeyboardButton { text: "Ủng hộ" },
             ],
-            vec![KeyboardButton {
-                text: "Gửi phản hồi",
-            }],
-            vec![KeyboardButton { text: "Ủng hộ" }],
         ],
         resize_keyboard: true,
         is_persistent: true,
@@ -1457,44 +1401,36 @@ struct BotCommandScopeChat {
     chat_id: i64,
 }
 
-fn default_commands() -> [BotCommand; 8] {
+fn default_commands() -> [BotCommand; 6] {
     [
         BotCommand {
             command: "start",
             description: "Bắt đầu hoặc bật lại thông báo",
         },
         BotCommand {
+            command: "events",
+            description: "Hoạt động và học bổng đang mở",
+        },
+        BotCommand {
+            command: "portal",
+            description: "Thông báo mới từ Cổng Đào tạo",
+        },
+        BotCommand {
             command: "settings",
-            description: "Chọn loại hoạt động và cách nhận",
-        },
-        BotCommand {
-            command: "pages",
-            description: "Xem các trang đang theo dõi",
-        },
-        BotCommand {
-            command: "help",
-            description: "Xem hướng dẫn",
+            description: "Cài đặt loại tin và thời gian",
         },
         BotCommand {
             command: "donate",
-            description: "Ủng hộ chi phí vận hành",
+            description: "Ủng hộ chi phí duy trì bot",
         },
         BotCommand {
-            command: "latest",
-            description: "Bài Facebook mới thu thập",
-        },
-        BotCommand {
-            command: "portal_history",
-            description: "Lịch sử thông báo Portal",
-        },
-        BotCommand {
-            command: "feedback",
-            description: "Gửi phản hồi cho quản trị viên",
+            command: "help",
+            description: "Xem hướng dẫn và hỗ trợ",
         },
     ]
 }
 
-fn admin_commands() -> [BotCommand; 14] {
+fn admin_commands() -> [BotCommand; 8] {
     let public = default_commands();
     [
         public[0],
@@ -1503,31 +1439,13 @@ fn admin_commands() -> [BotCommand; 14] {
         public[3],
         public[4],
         public[5],
-        public[6],
-        public[7],
         BotCommand {
             command: "admin",
-            description: "Mở công cụ quản trị",
+            description: "Bảng điều khiển quản trị",
         },
         BotCommand {
-            command: "pending",
-            description: "Đề xuất nguồn chờ duyệt",
-        },
-        BotCommand {
-            command: "reviews",
-            description: "Bài cần duyệt",
-        },
-        BotCommand {
-            command: "crawl_history",
-            description: "Lịch sử hoạt động crawl",
-        },
-        BotCommand {
-            command: "metrics",
-            description: "Kết quả vận hành 7 ngày",
-        },
-        BotCommand {
-            command: "feedbacks",
-            description: "Toàn bộ feedback đã gửi",
+            command: "report",
+            description: "Xuất tệp báo cáo vận hành hệ thống",
         },
     ]
 }
@@ -1617,9 +1535,11 @@ mod tests {
         );
         assert!(request.contains("\"allow_paid_broadcast\":false"));
         assert!(request.contains("\"chat_id\":123"));
-        assert!(request.contains("Trang đang theo dõi"));
-        assert!(request.contains("Đề xuất trang"));
+        assert!(request.contains("Hoạt động"));
+        assert!(request.contains("Cổng đào tạo"));
         assert!(request.contains("Cài đặt"));
+        assert!(request.contains("Trang theo dõi"));
+        assert!(request.contains("Trợ giúp"));
         assert!(request.contains("Ủng hộ"));
     }
 
@@ -1919,14 +1839,13 @@ mod tests {
 
         assert_eq!(outcome, TelegramConfigurationOutcome::Applied);
         assert!(request.contains("/setMyCommands"));
-        assert!(request.contains("Xem các trang đang theo dõi"));
-        assert!(request.contains("Chọn loại hoạt động và cách nhận"));
+        assert!(request.contains("Hoạt động và học bổng đang mở"));
+        assert!(request.contains("Cài đặt loại tin và thời gian"));
         assert!(!request.contains("\"scope\""));
+        assert!(request.contains(r#""command":"events""#));
+        assert!(request.contains(r#""command":"portal""#));
         assert!(request.contains(r#""command":"donate""#));
         assert!(!request.contains("\"suggest\""));
-        assert!(request.contains(r#""command":"latest""#));
-        assert!(request.contains(r#""command":"portal_history""#));
-        assert!(request.contains(r#""command":"feedback""#));
     }
 
     #[tokio::test]
@@ -1940,14 +1859,9 @@ mod tests {
         assert_eq!(outcome, TelegramConfigurationOutcome::Applied);
         assert!(request.contains(r#""scope":{"type":"chat","chat_id":123}"#));
         assert!(request.contains(r#""command":"admin""#));
-        assert!(request.contains(r#""command":"pending""#));
-        assert!(request.contains(r#""command":"reviews""#));
-        assert!(request.contains(r#""command":"crawl_history""#));
-        assert!(request.contains(r#""command":"latest""#));
-        assert!(request.contains(r#""command":"portal_history""#));
-        assert!(request.contains(r#""command":"metrics""#));
-        assert!(request.contains(r#""command":"feedback""#));
-        assert!(request.contains(r#""command":"feedbacks""#));
+        assert!(request.contains(r#""command":"report""#));
+        assert!(request.contains(r#""command":"events""#));
+        assert!(request.contains(r#""command":"portal""#));
         assert!(!request.contains(r#""command":"review_send""#));
     }
 

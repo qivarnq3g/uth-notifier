@@ -282,6 +282,40 @@ pub struct LatestPostRecord {
     pub post: FacebookPost,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveEventRecord {
+    pub campaign_id: i64,
+    pub post_id: i64,
+    pub source_name: String,
+    pub post_url: Option<String>,
+    pub action_url: Option<String>,
+    pub published_at: DateTime<Utc>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemReportStats {
+    pub total_subscribers: i64,
+    pub active_subscribers: i64,
+    pub instant_mode: i64,
+    pub daily_mode: i64,
+    pub scope_all: i64,
+    pub scope_drl: i64,
+    pub total_sources: i64,
+    pub active_sources: i64,
+    pub total_posts: i64,
+    pub latest_post_at: Option<DateTime<Utc>>,
+    pub total_classifications: i64,
+    pub rejected_classifications: i64,
+    pub manual_review_classifications: i64,
+    pub matched_explicit_classifications: i64,
+    pub total_campaigns: i64,
+    pub total_deliveries: i64,
+    pub sent_deliveries: i64,
+    pub portal_notices: i64,
+    pub ai_learning_examples: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualReviewAction {
     Send,
@@ -2878,6 +2912,115 @@ impl CrawlStore {
         row.map(latest_post_from_row).transpose()
     }
 
+    pub async fn active_events(&self, limit: i64, offset: i64) -> Result<Vec<ActiveEventRecord>> {
+        let limit = limit.clamp(1, 20);
+        let offset = offset.max(0);
+        let rows = sqlx::query(
+            "SELECT c.id AS campaign_id, c.post_id, s.name AS source_name, \
+                    c.post_url, c.action_url, p.published_at, p.text \
+             FROM campaigns AS c \
+             JOIN posts AS p ON p.id = c.post_id \
+             JOIN sources AS s ON s.id = p.source_id \
+             WHERE c.created_at >= CURRENT_TIMESTAMP - INTERVAL '14 days' \
+             ORDER BY p.published_at DESC, c.id DESC \
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ActiveEventRecord {
+                campaign_id: row.get("campaign_id"),
+                post_id: row.get("post_id"),
+                source_name: row.get("source_name"),
+                post_url: row.get("post_url"),
+                action_url: row.get("action_url"),
+                published_at: row.get("published_at"),
+                text: row.get("text"),
+            })
+            .collect())
+    }
+
+    pub async fn system_report_stats(&self) -> Result<SystemReportStats> {
+        let sub_row = sqlx::query(
+            "SELECT \
+                COUNT(*) AS total_subscribers, \
+                COUNT(*) FILTER (WHERE active) AS active_subscribers, \
+                COUNT(*) FILTER (WHERE delivery_mode = 'instant') AS instant_mode, \
+                COUNT(*) FILTER (WHERE delivery_mode = 'daily') AS daily_mode, \
+                COUNT(*) FILTER (WHERE notification_scope = 'all') AS scope_all, \
+                COUNT(*) FILTER (WHERE notification_scope = 'drl') AS scope_drl \
+             FROM subscribers",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let source_row = sqlx::query(
+            "SELECT \
+                COUNT(*) AS total_sources, \
+                COUNT(*) FILTER (WHERE enabled) AS active_sources, \
+                (SELECT COUNT(*) FROM posts) AS total_posts, \
+                (SELECT MAX(published_at) FROM posts) AS latest_post_at \
+             FROM sources",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let class_row = sqlx::query(
+            "SELECT \
+                COUNT(*) AS total_classifications, \
+                COUNT(*) FILTER (WHERE decision = 'rejected') AS rejected_classifications, \
+                COUNT(*) FILTER (WHERE decision = 'manual_review') AS manual_review_classifications, \
+                COUNT(*) FILTER (WHERE decision = 'matched_explicit') AS matched_explicit_classifications \
+             FROM classifications",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let deliv_row = sqlx::query(
+            "SELECT \
+                (SELECT COUNT(*) FROM campaigns) AS total_campaigns, \
+                COUNT(*) AS total_deliveries, \
+                COUNT(*) FILTER (WHERE status = 'sent') AS sent_deliveries \
+             FROM deliveries",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let portal_notices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM portal_notices")
+            .fetch_one(&self.pool)
+            .await?;
+
+        let ai_learning_examples: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ai_review_learning_examples")
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(SystemReportStats {
+            total_subscribers: sub_row.get("total_subscribers"),
+            active_subscribers: sub_row.get("active_subscribers"),
+            instant_mode: sub_row.get("instant_mode"),
+            daily_mode: sub_row.get("daily_mode"),
+            scope_all: sub_row.get("scope_all"),
+            scope_drl: sub_row.get("scope_drl"),
+            total_sources: source_row.get("total_sources"),
+            active_sources: source_row.get("active_sources"),
+            total_posts: source_row.get("total_posts"),
+            latest_post_at: source_row.get("latest_post_at"),
+            total_classifications: class_row.get("total_classifications"),
+            rejected_classifications: class_row.get("rejected_classifications"),
+            manual_review_classifications: class_row.get("manual_review_classifications"),
+            matched_explicit_classifications: class_row.get("matched_explicit_classifications"),
+            total_campaigns: deliv_row.get("total_campaigns"),
+            total_deliveries: deliv_row.get("total_deliveries"),
+            sent_deliveries: deliv_row.get("sent_deliveries"),
+            portal_notices,
+            ai_learning_examples,
+        })
+    }
+
     pub async fn manual_review(
         &self,
         classification_id: i64,
@@ -2929,7 +3072,7 @@ impl CrawlStore {
              JOIN sources AS source ON source.id = post.source_id \
              JOIN post_revisions AS revision ON revision.post_id = post.id \
                 AND revision.content_hash = classification.input_content_hash \
-             WHERE classification.id = $1 AND classification.decision = 'manual_review'",
+             WHERE classification.id = $1",
         )
         .bind(classification_id)
         .fetch_optional(&self.pool)
@@ -3187,7 +3330,7 @@ impl CrawlStore {
         .await?
         .context("manual review classification was not found")?;
         let decision: String = row.get("decision");
-        if decision != "manual_review" {
+        if decision != "manual_review" && decision != "matched_explicit" {
             bail!("classification is not eligible for manual review");
         }
         let prev_action: Option<String> = row.get("action");
@@ -3301,6 +3444,39 @@ impl CrawlStore {
         Ok(outcome)
     }
 
+    pub async fn record_classification_review_resolution(
+        &self,
+        classification_id: i64,
+        admin_chat_id: i64,
+        action: ManualReviewAction,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if classification_id <= 0 || admin_chat_id == 0 {
+            bail!("classification review IDs must be valid");
+        }
+        let action_name = match action {
+            ManualReviewAction::Send => "send",
+            ManualReviewAction::Skip => "skip",
+        };
+        sqlx::query(
+            "INSERT INTO manual_review_resolutions \
+             (classification_id, action, reviewed_by_chat_id, reason, reviewed_at) \
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) \
+             ON CONFLICT (classification_id) DO UPDATE SET \
+                action = EXCLUDED.action, \
+                reviewed_by_chat_id = EXCLUDED.reviewed_by_chat_id, \
+                reason = EXCLUDED.reason, \
+                reviewed_at = CURRENT_TIMESTAMP",
+        )
+        .bind(classification_id)
+        .bind(action_name)
+        .bind(admin_chat_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn record_ai_learning_feedback(
         &self,
         payload: AiLearningFeedbackPayload<'_>,
@@ -3324,10 +3500,7 @@ impl CrawlStore {
         Ok(id)
     }
 
-    pub async fn latest_ai_learning_examples(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<AiLearningExample>> {
+    pub async fn latest_ai_learning_examples(&self, limit: i64) -> Result<Vec<AiLearningExample>> {
         let limit = limit.clamp(1, 50);
         let rows = sqlx::query(
             "SELECT id, classification_id, post_id, post_text, source_name, \

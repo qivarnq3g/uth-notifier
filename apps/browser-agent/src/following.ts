@@ -14,6 +14,10 @@ type JsonObject = Record<string, unknown>;
 const searchUserAgent =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 const maxGraphqlResponseBytes = 2 * 1024 * 1024;
+const chromiumCrashReportingArgs = [
+  "--disable-breakpad",
+  "--disable-crash-reporter",
+] as const;
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -109,7 +113,11 @@ async function main(): Promise<void> {
     throw new Error("usage: following.ts <facebook-following-url> <output-json>");
   }
 
-  const browser = await chromium.launch({ executablePath, headless: true });
+  const browser = await chromium.launch({
+    executablePath,
+    headless: true,
+    args: [...chromiumCrashReportingArgs],
+  });
   try {
     const context = await browser.newContext({
       userAgent: searchUserAgent,

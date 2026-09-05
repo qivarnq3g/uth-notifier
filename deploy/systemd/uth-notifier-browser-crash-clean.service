@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune retained Chromium crash reports
+ConditionPathIsDirectory=/var/lib/uth-notifier/.config/chromium/Crash Reports/pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemd-tmpfiles --clean /etc/tmpfiles.d/uth-notifier-browser.conf
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths="/var/lib/uth-notifier/.config/chromium/Crash Reports/pending"

@@ -147,6 +147,19 @@ nhận lệnh Telegram từ edge. Timer `uth-notifier-backup` tạo PostgreSQL
 custom-format backup hằng ngày và giữ 14 ngày. Runtime secret nằm trong
 `/etc/uth-notifier/runtime.env` với quyền `0640`, không nằm trong release hay
 source tree.
+
+Install `deploy/tmpfiles.d/uth-notifier-browser.conf` under `/etc/tmpfiles.d/`,
+install the browser crash cleanup service and timer from `deploy/systemd/`, and
+enable `uth-notifier-browser-crash-clean.timer`. The timer removes Chromium crash
+reports older than one hour every 15 minutes. Install
+`deploy/journald.conf.d/uth-notifier-storage.conf` under
+`/etc/systemd/journald.conf.d/`; it caps persistent journal storage at 512 MiB,
+keeps 2 GiB free, and retains at most 14 days. Validate unit files with
+`systemd-analyze verify` and validate the tmpfiles rule with
+`systemd-tmpfiles --clean --dry-run`. Restart `systemd-journald`, then rotate and
+vacuum archived journals to the configured limit. Never apply automatic deletion
+to PostgreSQL business data or the active and rollback releases.
+
 The production scheduler also sets `FACEBOOK_BROWSER_NETWORK_MODE=prefer_ipv4`. The browser
 resolves the current Facebook A record at process start, uses a bounded Chromium resolver
 rule with QUIC disabled, and falls back to the system resolver when IPv4 resolution or
@@ -156,3 +169,13 @@ The scheduler release currently uses bounded `--concurrency 2`. This was enabled
 after a production observation of approximately 575 MiB scheduler cgroup peak with one
 browser and is guarded by `MemoryMax=1400M`; revert to 1 if the cgroup peak approaches
 the limit or browser failures increase.
+
+Browser fallback timeout handling must place Node and Chromium in a dedicated Unix process
+group, repeatedly terminate that group within a bounded 250-millisecond cleanup window, reap
+Node, and remove an exact per-invocation `uth-browser-run-*` directory supplied through
+`TMPDIR`, `TMP`, and `TEMP`. After a scheduler deployment, force one bounded one-second
+browser timeout without persistence and verify that profile, artifact, and browser-run
+directory counts do not increase, no root-owned Chromium remains, and the attempt retains
+the configured timeout outcome. A controlled scheduler restart must reduce historical
+`PrivateTmp` usage, release leases owned by the old PID, and keep temporary directory counts
+at or below the active browser concurrency.

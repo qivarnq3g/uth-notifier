@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically prune retained Chromium crash reports
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+AccuracySec=1min
+RandomizedDelaySec=1min
+Unit=uth-notifier-browser-crash-clean.service
+
+[Install]
+WantedBy=timers.target

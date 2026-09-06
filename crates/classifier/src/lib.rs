@@ -645,6 +645,26 @@ mod tests {
     }
 
     #[test]
+    fn past_event_ceremony_with_da_tham_gia_is_rejected() {
+        let classifier = RuleClassifier::from_bytes(CONFIG).unwrap();
+        let post = post(
+            "sha256:past-ceremony",
+            "Vào sáng ngày 05/9/2026, hơn 6.000 tân sinh viên khóa 2026 đã tham gia Lễ Khai giảng tại sân A5.",
+        );
+        let result = classifier
+            .classify(
+                &post,
+                true,
+                Utc.with_ymd_and_hms(2026, 9, 6, 12, 0, 0).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(result.decision, ClassificationDecision::Rejected);
+        assert!(result.features.past_event);
+        assert!(!result.features.future_deadline);
+    }
+
+    #[test]
     fn config_hash_is_stable() {
         let first = RuleClassifier::from_bytes(CONFIG).unwrap();
         let second = RuleClassifier::from_bytes(CONFIG).unwrap();

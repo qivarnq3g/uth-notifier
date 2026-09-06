@@ -1,6 +1,6 @@
 {
   "schema_version": "classifier-rules.v1",
-  "classifier_version": "rules-2026-08-27-restricted-audience",
+  "classifier_version": "rules-2026-09-06-event-context-update",
   "max_post_age_days": 60,
   "explicit_match_score": 7,
   "registration_form_match_score": 8,
@@ -23,9 +23,9 @@
     "target_students": ["sinh viên", "đoàn viên", "hội viên", "tân sinh viên"],
     "restricted_audience": ["sinh viên khoa", "tân sinh viên khoa", "tân sinh viên của khoa", "sinh viên khóa", "đội hình khoa"],
     "negative_commercial": ["tuyển dụng", "tuyển nhân viên", "mua ngay", "giảm giá", "khuyến mãi", "bán hàng", "chốt đơn"],
-    "completed_summary": ["tổng kết chương trình", "đã diễn ra thành công", "nhìn lại chương trình", "khép lại chương trình"],
+    "completed_summary": ["tổng kết chương trình", "đã diễn ra thành công", "nhìn lại chương trình", "khép lại chương trình", "tổng kết hoạt động", "khép lại hoạt động", "đã khép lại"],
     "deadline_context": ["hạn đăng ký", "hạn chót", "hạn cuối", "deadline", "đăng ký trước", "trước ngày", "chậm nhất", "thời hạn"],
-    "event_context": ["diễn ra", "tổ chức", "thời gian", "bắt đầu", "chương trình"]
+    "event_context": ["diễn ra", "tổ chức", "thời gian", "bắt đầu", "chương trình", "đã tham gia", "đã diễn ra", "đã tổ chức"]
   },
   "form_hosts": ["forms.gle", "docs.google.com", "form.office.com", "forms.office.com", "tally.so", "airtable.com", "typeform.com", "jotform.com"]
 }

@@ -65,7 +65,7 @@ jobs:
           sh -n deploy/backup.sh
           sh -n deploy/backup-loop.sh
           sh -n deploy/restore.sh
-          node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('config/facebook-sources.v1.json','utf8'));const ids=x.recommended_sources.map(s=>s.id);if(ids.length!==43||new Set(ids).size!==43)process.exit(1)"
+          node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('config/facebook-sources.v1.json','utf8'));const ids=x.recommended_sources.map(s=>s.id);if(ids.length!==47||new Set(ids).size!==47)process.exit(1)"
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Lint Rust workspace
@@ -93,3 +93,15 @@ jobs:
         run: cargo test -p uth-storage --test postgres_storage -- --ignored --test-threads=1
       - name: Build release agent
         run: cargo build --release -p uth-agent
+      - name: Compute agent checksum
+        run: |
+          cd target/release
+          sha256sum uth-agent > uth-agent.sha256
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uth-agent-ci-linux-amd64
+          path: |
+            target/release/uth-agent
+            target/release/uth-agent.sha256
+          retention-days: 7

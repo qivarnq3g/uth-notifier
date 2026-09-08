@@ -5236,7 +5236,7 @@ fn validate_notification_event(
         || database_post_id <= 0
         || payload_classification_id != Some(database_classification_id)
         || payload_post_id != Some(database_post_id)
-        || will_send != (decision == Some("matched_explicit"))
+        || (will_send && decision != Some("matched_explicit"))
     {
         bail!("notification plan does not match claimed classification event");
     }
@@ -5373,9 +5373,10 @@ fn source_alerts_are_systemic(enabled_sources: i64, sources_alerting: i64) -> bo
 #[cfg(test)]
 mod tests {
     use super::{
-        AdaptiveSchedule, ClaimedSource, DigestCandidate, OperationalAlertKind, PersistOutcome,
-        adaptive_next_schedule, build_digest_batch, operational_alert_kind, same_post_content,
-        source_alerts_are_systemic,
+        AdaptiveSchedule, ClaimedNotificationEvent, ClaimedSource, DigestCandidate,
+        OperationalAlertKind, PersistOutcome, adaptive_next_schedule, build_digest_batch,
+        operational_alert_kind, same_post_content, source_alerts_are_systemic,
+        validate_notification_event,
     };
     use uth_domain::{
         FacebookPost, MediaItem, POST_SCHEMA_VERSION, TELEGRAM_MESSAGE_LIMIT,
@@ -5601,6 +5602,46 @@ mod tests {
         );
 
         assert!(!same_post_content("Nội dung", &stored_media, &[], &post));
+    }
+
+    #[test]
+    fn validate_notification_event_allows_skipping_matched_explicit_post() {
+        let event = ClaimedNotificationEvent {
+            id: 1,
+            event_key: "classification:100".to_owned(),
+            event_type: "classification.completed".to_owned(),
+            payload: serde_json::json!({
+                "database_classification_id": 100,
+                "database_post_id": 200,
+                "classification": {
+                    "decision": "matched_explicit"
+                }
+            }),
+            attempts: 0,
+        };
+
+        let result = validate_notification_event(&event, 100, 200, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_notification_event_rejects_sending_non_explicit_post() {
+        let event = ClaimedNotificationEvent {
+            id: 1,
+            event_key: "classification:100".to_owned(),
+            event_type: "classification.completed".to_owned(),
+            payload: serde_json::json!({
+                "database_classification_id": 100,
+                "database_post_id": 200,
+                "classification": {
+                    "decision": "manual_review"
+                }
+            }),
+            attempts: 0,
+        };
+
+        let result = validate_notification_event(&event, 100, 200, true);
+        assert!(result.is_err());
     }
 
     fn post_with_media(url: &str) -> FacebookPost {

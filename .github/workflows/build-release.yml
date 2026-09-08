@@ -1,0 +1,55 @@
+name: Build Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/core-agent/**'
+      - 'crates/**'
+      - 'config/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/build-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Build uth-agent
+        run: cargo build --locked --release -p uth-agent
+
+      - name: Compute SHA256 checksum
+        run: |
+          cd target/release
+          sha256sum uth-agent > uth-agent.sha256
+          echo "Binary SHA256:"
+          cat uth-agent.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uth-agent-linux-amd64
+          path: |
+            target/release/uth-agent
+            target/release/uth-agent.sha256
+          retention-days: 7

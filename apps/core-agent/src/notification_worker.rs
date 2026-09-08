@@ -2674,7 +2674,7 @@ async fn build_interaction_reply(
                 }))
             } else {
                 Ok(simple_reply(format!(
-                    "Không thể duyệt bài #{id} (có thể đã có campaign gửi trước đó)."
+                    "Bài #{id} đã được duyệt trước đó và chiến dịch gửi tin đang hoạt động (hoặc đã gửi hoàn tất)."
                 )))
             }
         }

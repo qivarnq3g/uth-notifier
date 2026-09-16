@@ -46,9 +46,27 @@ jobs:
       - name: Install browser agent dependencies
         working-directory: apps/browser-agent
         run: npm ci --ignore-scripts
+      - name: Cache managed Chromium
+        uses: actions/cache@v4
+        with:
+          path: apps/browser-agent/node_modules/playwright-core/.local-browsers
+          key: playwright-${{ runner.os }}-${{ hashFiles('apps/browser-agent/package-lock.json') }}
+      - name: Test browser agent
+        working-directory: apps/browser-agent
+        run: npm test
       - name: Check browser agent types
         working-directory: apps/browser-agent
         run: npm run typecheck
+      - name: Build browser agent
+        working-directory: apps/browser-agent
+        run: npm run build
+      - name: Verify managed Chromium
+        working-directory: apps/browser-agent
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: '0'
+        run: |
+          node node_modules/playwright-core/cli.js install --only-shell chromium
+          npm run verify:browser
       - name: Audit browser agent dependencies
         working-directory: apps/browser-agent
         run: npm audit --audit-level=high

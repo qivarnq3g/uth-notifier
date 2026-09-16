@@ -5,8 +5,10 @@ on:
     branches: [main]
     paths:
       - 'apps/core-agent/**'
+      - 'apps/browser-agent/**'
       - 'crates/**'
       - 'config/**'
+      - 'deploy/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -24,7 +26,7 @@ jobs:
   build:
     name: Build Linux amd64
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,21 +37,70 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/browser-agent/package-lock.json
+
+      - name: Install browser agent dependencies
+        working-directory: apps/browser-agent
+        run: npm ci --ignore-scripts
+
+      - name: Cache managed Chromium
+        uses: actions/cache@v4
+        with:
+          path: apps/browser-agent/node_modules/playwright-core/.local-browsers
+          key: playwright-${{ runner.os }}-${{ hashFiles('apps/browser-agent/package-lock.json') }}
+
+      - name: Test and build browser agent
+        working-directory: apps/browser-agent
+        run: |
+          npm test
+          npm run typecheck
+          npm run build
+          npm prune --omit=dev --ignore-scripts
+
+      - name: Install and verify managed Chromium
+        working-directory: apps/browser-agent
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: '0'
+        run: |
+          node node_modules/playwright-core/cli.js install --only-shell chromium
+          npm run verify:browser
+
       - name: Build uth-agent
         run: cargo build --locked --release -p uth-agent
 
-      - name: Compute SHA256 checksum
+      - name: Build runtime bundle
+        run: |
+          stage=target/runtime-linux-amd64
+          install -Dm755 target/release/uth-agent "$stage/bin/uth-agent"
+          cp -a config "$stage/config"
+          cp -a deploy "$stage/deploy"
+          mkdir -p "$stage/apps/browser-agent"
+          cp -a apps/browser-agent/dist "$stage/apps/browser-agent/dist"
+          cp -a apps/browser-agent/node_modules "$stage/apps/browser-agent/node_modules"
+          install -m644 apps/browser-agent/package.json "$stage/apps/browser-agent/package.json"
+          install -m644 apps/browser-agent/package-lock.json "$stage/apps/browser-agent/package-lock.json"
+          PLAYWRIGHT_BROWSERS_PATH=0 node "$stage/apps/browser-agent/dist/verify-runtime.js"
+          tar -C "$stage" -czf target/release/uth-notifier-runtime-linux-amd64.tar.gz .
+
+      - name: Compute SHA256 checksums
         run: |
           cd target/release
           sha256sum uth-agent > uth-agent.sha256
-          echo "Binary SHA256:"
+          sha256sum uth-notifier-runtime-linux-amd64.tar.gz > uth-notifier-runtime-linux-amd64.tar.gz.sha256
           cat uth-agent.sha256
+          cat uth-notifier-runtime-linux-amd64.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: uth-agent-linux-amd64
+          name: uth-notifier-linux-amd64
           path: |
             target/release/uth-agent
             target/release/uth-agent.sha256
+            target/release/uth-notifier-runtime-linux-amd64.tar.gz
+            target/release/uth-notifier-runtime-linux-amd64.tar.gz.sha256
           retention-days: 7

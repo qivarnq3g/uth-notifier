@@ -2,6 +2,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { chromium, type BrowserContext, type Response } from "playwright-core";
 
+import { chromiumLaunchOptions } from "./browser-runtime.ts";
+
 type FollowedSource = {
   id: string;
   name: string;
@@ -106,18 +108,13 @@ async function collectResponse(
 async function main(): Promise<void> {
   const profileUrl = process.argv[2];
   const outputPath = process.argv[3];
-  const executablePath =
-    process.env.CHROME_PATH ??
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
   if (!profileUrl || !outputPath) {
     throw new Error("usage: following.ts <facebook-following-url> <output-json>");
   }
 
-  const browser = await chromium.launch({
-    executablePath,
-    headless: true,
-    args: [...chromiumCrashReportingArgs],
-  });
+  const browser = await chromium.launch(
+    chromiumLaunchOptions(chromiumCrashReportingArgs, process.env.CHROME_PATH),
+  );
   try {
     const context = await browser.newContext({
       userAgent: searchUserAgent,

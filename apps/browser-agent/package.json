@@ -8,7 +8,8 @@
     "post": "node --experimental-strip-types src/post.ts",
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --noEmit false"
+    "build": "tsc --noEmit false",
+    "verify:browser": "node dist/verify-runtime.js"
   },
   "dependencies": {
     "playwright-core": "1.61.1"

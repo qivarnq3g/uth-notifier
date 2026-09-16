@@ -1098,16 +1098,19 @@ async function captureSnapshot(
 ): Promise<BrowserSnapshot> {
   const startedAt = Date.now();
   const browser = await chromium.launch(
-    chromiumLaunchOptions([
-      ...chromiumCrashReportingArgs,
-      "--disable-background-networking",
-      "--disable-component-update",
-      "--disable-default-apps",
-      "--disable-extensions",
-      "--disable-sync",
-      "--no-first-run",
-      ...chromiumNetworkArgs(network.ipv4Address),
-    ], executablePath),
+    chromiumLaunchOptions(
+      [
+        ...chromiumCrashReportingArgs,
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-extensions",
+        "--disable-sync",
+        "--no-first-run",
+        ...chromiumNetworkArgs(network.ipv4Address),
+      ],
+      executablePath,
+    ),
   );
   try {
     const context = await browser.newContext({

@@ -3,7 +3,10 @@ import { chromium } from "playwright-core";
 import { chromiumLaunchOptions } from "./browser-runtime.ts";
 
 const browser = await chromium.launch(
-  chromiumLaunchOptions(["--disable-breakpad", "--disable-crash-reporter"]),
+  chromiumLaunchOptions(
+    ["--disable-breakpad", "--disable-crash-reporter"],
+    process.env.CHROME_PATH,
+  ),
 );
 const browserVersion = browser.version();
 try {

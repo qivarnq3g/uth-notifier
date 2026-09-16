@@ -113,7 +113,7 @@ async function main(): Promise<void> {
   }
 
   const browser = await chromium.launch(
-    chromiumLaunchOptions(chromiumCrashReportingArgs),
+    chromiumLaunchOptions(chromiumCrashReportingArgs, process.env.CHROME_PATH),
   );
   try {
     const context = await browser.newContext({

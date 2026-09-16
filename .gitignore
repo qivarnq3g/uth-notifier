@@ -6,6 +6,12 @@ tmp/
 node_modules/
 .agents/
 .worktrees/
+/.antigravity/
+/.claude/
+/.codex/
+/.cursor/
+/.gemini/
+/.mcp.json
 skills-lock.json
 .env
 .env.*
@@ -15,7 +21,9 @@ deploy/secrets/
 AGENTS.md
 AGENTS_old.md
 AGENTS.local.md
+/CLAUDE.md
 CLAUDE.local.md
+/GEMINI.md
 /bai-dang-facebook-uth-notifier.md
 apps/edge-worker/build/
 apps/edge-worker/.wrangler/

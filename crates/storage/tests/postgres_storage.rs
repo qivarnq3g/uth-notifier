@@ -405,6 +405,40 @@ async fn durable_pipeline_is_idempotent_and_handles_classifier_failures() {
         .into_iter()
         .next()
         .unwrap();
+    assert_eq!(
+        store
+            .defer_notification_event_for_ai(
+                &notification_event,
+                owner,
+                "Gemini quota exhausted",
+                60
+            )
+            .await
+            .unwrap(),
+        FailureDisposition::RetryScheduled
+    );
+    let deferred_state: (bool, bool) = sqlx::query_as(
+        "SELECT processed_at IS NULL, available_at > CURRENT_TIMESTAMP FROM outbox_events WHERE id = $1",
+    )
+    .bind(notification_event.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred_state, (true, true));
+    sqlx::query("UPDATE outbox_events SET available_at = CURRENT_TIMESTAMP WHERE id = $1")
+        .bind(notification_event.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resumed_event = store
+        .claim_notification_events(owner, 1, 60)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(resumed_event.id, notification_event.id);
+    let notification_event = resumed_event;
     let classification_id = notification_event.payload["database_classification_id"]
         .as_i64()
         .unwrap();
@@ -923,6 +957,37 @@ async fn durable_pipeline_is_idempotent_and_handles_classifier_failures() {
     .await
     .unwrap();
     assert_eq!(inherited_action, "skip");
+    let ai_classification_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO classifications \
+         (post_id, schema_version, input_content_hash, decision, score, \
+          confidence_basis_points, matched_rules, classifier_version, config_hash, classified_at) \
+         VALUES ($1, 'classification.v1', 'sha256:second', 'manual_review', 4, 6500, \
+          '[]'::jsonb, 'automated-review-test', \
+          'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', \
+          CURRENT_TIMESTAMP) RETURNING id",
+    )
+    .bind(post_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let ai_resolution = store
+        .resolve_ai_review(
+            ai_classification_id,
+            ManualReviewAction::Skip,
+            "[Gemini AI] Không phù hợp",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(ai_resolution.resolved);
+    let ai_reviewer_chat_id: i64 = sqlx::query_scalar(
+        "SELECT reviewed_by_chat_id FROM manual_review_resolutions WHERE classification_id = $1",
+    )
+    .bind(ai_classification_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ai_reviewer_chat_id, 0);
     make_due(&pool).await;
     let source = claim(&store, owner).await;
     let mut plugin_report = healthy_report("sha256:plugin", "Plugin fallback text");

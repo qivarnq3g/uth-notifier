@@ -26,7 +26,7 @@ Bot theo dõi hoạt động Điểm rèn luyện (ĐRL) và thông báo công k
    * Tự động giải quyết và tải tệp đính kèm PDF chính thức từ `daotao.ut.edu.vn`, tải lên Telegram một lần và tái sử dụng `file_id`.
 3. **Phân loại Thông minh 2 Tầng (Hybrid Classifier):**
    * **Tầng 1 (Explainable Rules Engine):** Trích xuất các tín hiệu `explicit_drl`, `registration_call`, `form_link`, `future_deadline`, `future_event_time`, `target_students`. Áp dụng quy tắc `risk.restricted_audience` để giữ lại các bài giới hạn khoa/khóa cho quản trị viên duyệt.
-   * **Tầng 2 (Gemini AI Auto-Reviewer):** Sử dụng mô hình `gemini-3.5-flash-lite` với cơ chế dynamic few-shot prompt. Lọc triệt để bài đăng quá 3 ngày hoặc sự kiện đã diễn ra; trả về lý do bằng tiếng Việt chuẩn có dấu; tự động học hỏi từ các quyết định điều chỉnh của quản trị viên (`/ai_approve`, `/ai_reject`).
+   * **Tầng 2 (Gemini AI Auto-Reviewer):** Sử dụng mô hình `gemini-3.5-flash-lite` với cơ chế dynamic few-shot prompt. Lọc triệt để bài đăng quá 3 ngày hoặc sự kiện đã diễn ra; trả về lý do bằng tiếng Việt chuẩn có dấu; tự động học hỏi từ các quyết định điều chỉnh của quản trị viên (`/ai_approve`, `/ai_reject`). Bài cần AI xét sẽ tự thử lại khi Gemini hết quota hoặc tạm lỗi; nếu quá 3 ngày tuổi trước khi AI hồi phục, bài được tự động bỏ qua.
 4. **Trải nghiệm Telegram Toàn diện:**
    * **Dành cho Sinh viên:**
      * Bật/tắt nhận tin hoạt động (`/start`, `/stop`). Lưu ý: Thông báo Portal là thông báo quan trọng, luôn được gửi ngay lập tức.
@@ -165,6 +165,7 @@ $env:DATABASE_URL = "postgresql://uth_agent@localhost/uth_notifier"
 $env:TELEGRAM_BOT_TOKEN = "your_bot_token"
 $env:TELEGRAM_ADMIN_CHAT_ID = "your_admin_chat_id"
 $env:GEMINI_API_KEY = "your_gemini_api_key"
+$env:GEMINI_FALLBACK_API_KEY = "your_fallback_gemini_api_key"
 
 target/release/uth-agent notify
 ```

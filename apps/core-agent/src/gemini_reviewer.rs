@@ -27,7 +27,7 @@ pub struct GeminiReviewOutput {
 #[derive(Clone)]
 pub struct GeminiReviewerClient {
     client: Client,
-    api_key: String,
+    api_keys: Vec<String>,
     model: String,
     api_base: Url,
 }
@@ -78,14 +78,32 @@ struct RawReviewDecision {
 }
 
 impl GeminiReviewerClient {
-    pub fn new(api_key: String, model: String, api_base: Url) -> Self {
+    pub fn new(
+        primary_api_key: String,
+        fallback_api_key: Option<String>,
+        model: String,
+        api_base: Url,
+    ) -> Self {
         let client = Client::builder()
             .timeout(DEFAULT_TIMEOUT)
             .build()
             .unwrap_or_else(|_| Client::new());
+        let mut api_keys = Vec::with_capacity(2);
+        let primary_api_key = primary_api_key.trim();
+        if !primary_api_key.is_empty() {
+            api_keys.push(primary_api_key.to_owned());
+        }
+        if let Some(fallback_api_key) = fallback_api_key {
+            let fallback_api_key = fallback_api_key.trim();
+            if !fallback_api_key.is_empty()
+                && !api_keys.iter().any(|api_key| api_key == fallback_api_key)
+            {
+                api_keys.push(fallback_api_key.to_owned());
+            }
+        }
         Self {
             client,
-            api_key,
+            api_keys,
             model,
             api_base,
         }
@@ -149,11 +167,38 @@ impl GeminiReviewerClient {
             },
         };
 
+        if self.api_keys.is_empty() {
+            bail!("no Gemini API keys are configured");
+        }
+        let mut attempt_errors = Vec::with_capacity(self.api_keys.len());
+        for (index, api_key) in self.api_keys.iter().enumerate() {
+            match self
+                .review_post_with_api_key(&endpoint, api_key, &request_payload)
+                .await
+            {
+                Ok(output) => return Ok(output),
+                Err(error) => {
+                    attempt_errors.push(format!("API key attempt {} failed: {error:#}", index + 1))
+                }
+            }
+        }
+        bail!(
+            "all Gemini API key attempts failed: {}",
+            attempt_errors.join("; ")
+        )
+    }
+
+    async fn review_post_with_api_key(
+        &self,
+        endpoint: &str,
+        api_key: &str,
+        request_payload: &GeminiGenerateRequest,
+    ) -> Result<GeminiReviewOutput> {
         let response = self
             .client
-            .post(&endpoint)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&request_payload)
+            .post(endpoint)
+            .header("x-goog-api-key", api_key)
+            .json(request_payload)
             .send()
             .await
             .context("failed to send request to Gemini API")?;
@@ -315,12 +360,56 @@ fn shorten_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
 
     fn test_vn_now() -> DateTime<FixedOffset> {
         let offset = FixedOffset::east_opt(7 * 3600).unwrap();
         DateTime::parse_from_rfc3339("2026-09-05T10:00:00+07:00")
             .unwrap()
             .with_timezone(&offset)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut expected_length = None;
+        loop {
+            let bytes_read = stream.read(&mut buffer).unwrap();
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if expected_length.is_none()
+                && let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+            {
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or_default();
+                expected_length = Some(header_end + content_length);
+            }
+            if expected_length.is_some_and(|length| request.len() >= length) {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
     }
 
     #[test]
@@ -414,5 +503,100 @@ mod tests {
         assert_eq!(parsed.decision, "send");
         assert_eq!(parsed.reason, "Có cấp ĐRL và học bổng");
         assert_eq!(parsed.confidence, Some(0.95));
+    }
+
+    #[test]
+    fn reviewer_orders_and_normalizes_distinct_api_keys() {
+        let reviewer = GeminiReviewerClient::new(
+            " primary-key ".to_owned(),
+            Some(" fallback-key ".to_owned()),
+            "test-model".to_owned(),
+            Url::parse("https://example.com").unwrap(),
+        );
+
+        assert_eq!(reviewer.api_keys, vec!["primary-key", "fallback-key"]);
+    }
+
+    #[test]
+    fn reviewer_ignores_duplicate_or_blank_fallback_api_key() {
+        let duplicate = GeminiReviewerClient::new(
+            "primary-key".to_owned(),
+            Some(" primary-key ".to_owned()),
+            "test-model".to_owned(),
+            Url::parse("https://example.com").unwrap(),
+        );
+        let blank = GeminiReviewerClient::new(
+            "primary-key".to_owned(),
+            Some("   ".to_owned()),
+            "test-model".to_owned(),
+            Url::parse("https://example.com").unwrap(),
+        );
+
+        assert_eq!(duplicate.api_keys, vec!["primary-key"]);
+        assert_eq!(blank.api_keys, vec!["primary-key"]);
+    }
+
+    #[tokio::test]
+    async fn reviewer_uses_fallback_key_after_primary_http_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut observed_api_keys = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let api_key = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("x-goog-api-key")
+                            .then(|| value.trim().to_owned())
+                    })
+                    .unwrap();
+                observed_api_keys.push(api_key);
+                if attempt == 0 {
+                    write_http_response(
+                        &mut stream,
+                        "429 Too Many Requests",
+                        r#"{"error":{"message":"quota exceeded"}}"#,
+                    );
+                } else {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"candidates":[{"content":{"parts":[{"text":"{\"decision\":\"send\",\"reason\":\"Phù hợp\",\"confidence\":0.91}"}]}}]}"#,
+                    );
+                }
+            }
+            sender.send(observed_api_keys).unwrap();
+        });
+        let reviewer = GeminiReviewerClient::new(
+            "primary-key".to_owned(),
+            Some("fallback-key".to_owned()),
+            "test-model".to_owned(),
+            Url::parse(&format!("http://{address}")).unwrap(),
+        );
+
+        let output = reviewer
+            .review_post(
+                "Nguồn thử nghiệm",
+                "Thông báo học bổng cho sinh viên",
+                "https://example.com/post",
+                "2026-09-05T09:00:00+07:00",
+                Some(test_vn_now()),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.decision, GeminiReviewDecision::Send);
+        assert_eq!(output.reason, "Phù hợp");
+        assert_eq!(output.confidence, 0.91);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec!["primary-key", "fallback-key"]
+        );
+        server.join().unwrap();
     }
 }

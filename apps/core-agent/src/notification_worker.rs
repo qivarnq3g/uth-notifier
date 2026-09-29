@@ -132,6 +132,9 @@ pub struct NotifyArgs {
     #[arg(long, env = "GEMINI_API_KEY", hide_env_values = true)]
     pub gemini_api_key: Option<String>,
 
+    #[arg(long, env = "GEMINI_FALLBACK_API_KEY", hide_env_values = true)]
+    pub gemini_fallback_api_key: Option<String>,
+
     #[arg(long, env = "GEMINI_MODEL", default_value = "gemini-3.5-flash-lite")]
     pub gemini_model: String,
 
@@ -464,6 +467,24 @@ struct PlanReport {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticReviewAction {
+    Send,
+    Skip,
+    Retry,
+}
+
+#[derive(Debug)]
+struct AiReviewUnavailable(String);
+
+impl std::fmt::Display for AiReviewUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AiReviewUnavailable {}
+
 #[derive(Debug, Serialize)]
 struct DeliveryReport {
     delivery_id: i64,
@@ -528,13 +549,19 @@ pub async fn run(args: NotifyArgs) -> Result<()> {
         (None, None, None, None, None) => None,
         _ => bail!("all payOS credentials and return URLs must be configured together"),
     };
-    let gemini = args.gemini_api_key.as_ref().map(|key| {
-        GeminiReviewerClient::new(
-            key.clone(),
-            args.gemini_model.clone(),
-            args.gemini_api_base.clone(),
-        )
-    });
+    let primary_gemini_api_key = normalized_optional_value(args.gemini_api_key.as_deref());
+    let fallback_gemini_api_key =
+        normalized_optional_value(args.gemini_fallback_api_key.as_deref());
+    let gemini = primary_gemini_api_key
+        .or_else(|| fallback_gemini_api_key.clone())
+        .map(|primary_api_key| {
+            GeminiReviewerClient::new(
+                primary_api_key,
+                fallback_gemini_api_key,
+                args.gemini_model.clone(),
+                args.gemini_api_base.clone(),
+            )
+        });
     if args.admin_only {
         store
             .deactivate_subscribers_except(
@@ -1247,11 +1274,16 @@ async fn run_cycle(
         portal,
     } = inputs;
     let digest = run_digest_cycle(store, telegram, owner, args).await?;
+    let plan_batch_size = if gemini.is_some() {
+        1
+    } else {
+        args.plan_batch_size
+    };
     let events = store
         .claim_notification_events(
             owner,
-            i64::try_from(args.plan_batch_size)?,
-            i64::try_from(args.lease_duration)?,
+            i64::try_from(plan_batch_size)?,
+            i64::try_from(args.lease_duration.max(60))?,
         )
         .await?;
     let planned_events = events.len();
@@ -3999,11 +4031,22 @@ async fn plan_event(
         },
         Err(error) => {
             let message = error.to_string();
-            let delay =
-                retry_delay_seconds(event.attempts, args.base_retry_delay, args.max_retry_delay);
-            let disposition = store
-                .fail_notification_event(&event, owner, &message, args.max_attempts, delay)
-                .await;
+            let disposition = if error.is::<AiReviewUnavailable>() {
+                let delay = retry_delay_seconds(event.attempts, 300, 7_200)
+                    .saturating_add(event.id.unsigned_abs() % 61);
+                store
+                    .defer_notification_event_for_ai(&event, owner, &message, delay)
+                    .await
+            } else {
+                let delay = retry_delay_seconds(
+                    event.attempts,
+                    args.base_retry_delay,
+                    args.max_retry_delay,
+                );
+                store
+                    .fail_notification_event(&event, owner, &message, args.max_attempts, delay)
+                    .await
+            };
             PlanReport {
                 event_key: event.event_key,
                 outcome: None,
@@ -4138,111 +4181,116 @@ async fn plan_event_inner(
                 .inherit_duplicate_manual_review_resolution(payload.database_classification_id)
                 .await?;
             if !inherited
-                && let Some(admin_chat_id) = admin_chat_id
                 && let Some(review) = store
                     .manual_review(payload.database_classification_id)
                     .await?
             {
-                let mut resolved_by_gemini = false;
-                if let Some(gemini_client) = gemini {
+                let review_url = delivery_post_url(&review.post);
+                let now = Utc::now();
+                let expired = automatic_review_action(&review.post.published_at, now, None)?
+                    == AutomaticReviewAction::Skip;
+                let gemini_output = if expired {
+                    None
+                } else {
+                    let gemini_client = gemini.ok_or_else(|| {
+                        AiReviewUnavailable(
+                            "Gemini is not configured; automatic review deferred".to_owned(),
+                        )
+                    })?;
                     let examples = store
                         .latest_ai_learning_examples(5)
                         .await
                         .unwrap_or_default();
-                    let review_url = delivery_post_url(&review.post);
-                    match gemini_client
-                        .review_post(
-                            &review.source_name,
-                            &review.post.text,
-                            &review_url,
-                            &review.post.published_at,
-                            None,
-                            &examples,
-                        )
-                        .await
-                    {
-                        Ok(gemini_output) => match gemini_output.decision {
-                            GeminiReviewDecision::Send => {
-                                let notif_text = render_notification(&review.post);
-                                let outcome = store
-                                    .resolve_manual_review(
-                                        payload.database_classification_id,
-                                        admin_chat_id,
-                                        admin_chat_id,
-                                        ManualReviewAction::Send,
-                                        Some(&format!("[Gemini AI] {}", gemini_output.reason)),
-                                        Some(ManualReviewNotification {
-                                            message_text: &notif_text,
-                                            post_url: &review_url,
-                                        }),
-                                    )
-                                    .await?;
-                                if outcome.resolved {
-                                    resolved_by_gemini = true;
-                                    let admin_msg = format!(
-                                        "GEMINI AI: BÀI ĐÃ DUYỆT #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu duyệt sai, bấm: /ai_reject_{}",
-                                        payload.database_classification_id,
-                                        review.source_name,
-                                        format_vietnam_datetime(&review.post.published_at),
-                                        gemini_output.reason,
-                                        gemini_output.confidence * 100.0,
-                                        shorten_chars(&review.post.text, 500),
-                                        review_url,
-                                        payload.database_classification_id
-                                    );
-                                    let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
-                                }
-                            }
-                            GeminiReviewDecision::Skip => {
-                                let outcome = store
-                                    .resolve_manual_review(
-                                        payload.database_classification_id,
-                                        admin_chat_id,
-                                        admin_chat_id,
-                                        ManualReviewAction::Skip,
-                                        Some(&format!("[Gemini AI] {}", gemini_output.reason)),
-                                        None,
-                                    )
-                                    .await?;
-                                if outcome.resolved {
-                                    resolved_by_gemini = true;
-                                    let admin_msg = format!(
-                                        "GEMINI AI: BÀI ĐÃ BỎ QUA #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
-                                        payload.database_classification_id,
-                                        review.source_name,
-                                        format_vietnam_datetime(&review.post.published_at),
-                                        gemini_output.reason,
-                                        gemini_output.confidence * 100.0,
-                                        shorten_chars(&review.post.text, 500),
-                                        review_url,
-                                        payload.database_classification_id
-                                    );
-                                    let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
-                                }
-                            }
-                        },
-                        Err(err) => {
-                            eprintln!("Gemini review error, fallback to manual review: {err:#}");
+                    Some(
+                        gemini_client
+                            .review_post(
+                                &review.source_name,
+                                &review.post.text,
+                                &review_url,
+                                &review.post.published_at,
+                                None,
+                                &examples,
+                            )
+                            .await
+                            .map_err(|error| {
+                                AiReviewUnavailable(format!("Gemini review deferred: {error:#}"))
+                            })?,
+                    )
+                };
+                let action = automatic_review_action(
+                    &review.post.published_at,
+                    Utc::now(),
+                    gemini_output.as_ref().map(|output| output.decision),
+                )?;
+                match action {
+                    AutomaticReviewAction::Send => {
+                        let output = gemini_output
+                            .as_ref()
+                            .context("missing Gemini send decision")?;
+                        let notification = render_notification(&review.post);
+                        let outcome = store
+                            .resolve_ai_review(
+                                payload.database_classification_id,
+                                ManualReviewAction::Send,
+                                &format!("[Gemini AI] {}", output.reason),
+                                Some(ManualReviewNotification {
+                                    message_text: &notification,
+                                    post_url: &review_url,
+                                }),
+                            )
+                            .await?;
+                        if outcome.resolved
+                            && let Some(admin_chat_id) = admin_chat_id
+                        {
+                            let admin_msg = format!(
+                                "GEMINI AI: BÀI ĐÃ DUYỆT #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu duyệt sai, bấm: /ai_reject_{}",
+                                payload.database_classification_id,
+                                review.source_name,
+                                format_vietnam_datetime(&review.post.published_at),
+                                output.reason,
+                                output.confidence * 100.0,
+                                shorten_chars(&review.post.text, 500),
+                                review_url,
+                                payload.database_classification_id
+                            );
+                            let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
                         }
                     }
-                }
-                if !resolved_by_gemini {
-                    match telegram
-                        .send_message(admin_chat_id, &render_manual_review_detail(&review))
-                        .await
-                    {
-                        TelegramSendOutcome::Sent { .. } => {}
-                        TelegramSendOutcome::RetryAfter { seconds, detail } => {
-                            bail!(
-                                "Telegram yêu cầu chờ {seconds} giây khi báo bài cần duyệt: {detail}"
+                    AutomaticReviewAction::Skip => {
+                        let ai_skip = gemini_output
+                            .as_ref()
+                            .filter(|output| output.decision == GeminiReviewDecision::Skip);
+                        let reason = ai_skip
+                            .map(|output| format!("[Gemini AI] {}", output.reason))
+                            .unwrap_or_else(|| "[Auto] Bài đã đăng từ 3 ngày trở lên".to_owned());
+                        let outcome = store
+                            .resolve_ai_review(
+                                payload.database_classification_id,
+                                ManualReviewAction::Skip,
+                                &reason,
+                                None,
                             )
+                            .await?;
+                        if outcome.resolved
+                            && let Some(output) = ai_skip
+                            && let Some(admin_chat_id) = admin_chat_id
+                        {
+                            let admin_msg = format!(
+                                "GEMINI AI: BÀI ĐÃ BỎ QUA #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
+                                payload.database_classification_id,
+                                review.source_name,
+                                format_vietnam_datetime(&review.post.published_at),
+                                output.reason,
+                                output.confidence * 100.0,
+                                shorten_chars(&review.post.text, 500),
+                                review_url,
+                                payload.database_classification_id
+                            );
+                            let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
                         }
-                        TelegramSendOutcome::ChatMigrated { detail, .. }
-                        | TelegramSendOutcome::PermanentFailure { detail, .. }
-                        | TelegramSendOutcome::TransientFailure { detail }
-                        | TelegramSendOutcome::AuthenticationFailure { detail } => {
-                            bail!("không thể báo bài cần duyệt cho admin: {detail}")
-                        }
+                    }
+                    AutomaticReviewAction::Retry => {
+                        return Err(AiReviewUnavailable("Gemini review deferred".to_owned()).into());
                     }
                 }
             }
@@ -4650,6 +4698,24 @@ fn retry_delay_seconds(attempt: u32, base: u64, maximum: u64) -> u64 {
     base.saturating_mul(1_u64 << exponent).min(maximum)
 }
 
+fn automatic_review_action(
+    published_at: &str,
+    now: DateTime<Utc>,
+    ai_decision: Option<GeminiReviewDecision>,
+) -> Result<AutomaticReviewAction> {
+    let published_at = DateTime::parse_from_rfc3339(published_at)
+        .context("invalid publication timestamp for automatic review")?
+        .with_timezone(&Utc);
+    if now.signed_duration_since(published_at) >= ChronoDuration::days(3) {
+        return Ok(AutomaticReviewAction::Skip);
+    }
+    Ok(match ai_decision {
+        Some(GeminiReviewDecision::Send) => AutomaticReviewAction::Send,
+        Some(GeminiReviewDecision::Skip) => AutomaticReviewAction::Skip,
+        None => AutomaticReviewAction::Retry,
+    })
+}
+
 fn count_delivery_outcome(reports: &[DeliveryReport], outcome: &str) -> usize {
     reports
         .iter()
@@ -4709,6 +4775,7 @@ fn render_operational_alert(kind: OperationalAlertKind, health: &OperationalHeal
 
 #[cfg(test)]
 mod tests {
+    use crate::gemini_reviewer::GeminiReviewDecision;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use uth_storage::{
         ActiveEventRecord, CrawlAttemptHistoryRecord, CrawlHistoryDetail, CrawlHistoryRecord,
@@ -4717,12 +4784,12 @@ mod tests {
     };
 
     use super::{
-        DonationConfig, InteractionCommand, PortalCycleReport, PortalPollConfig,
-        SUPPORT_GROUP_INVITATION, display_bank, next_portal_poll_state,
-        normalize_facebook_page_url, parse_donation_amount, parse_interaction_command,
-        render_active_events_page, render_crawl_history_detail, render_crawl_history_page,
-        render_donation, render_help, render_operational_alert, render_operational_health,
-        render_payment_account, render_portal_notice_history_detail,
+        AutomaticReviewAction, DonationConfig, InteractionCommand, PortalCycleReport,
+        PortalPollConfig, SUPPORT_GROUP_INVITATION, automatic_review_action, display_bank,
+        next_portal_poll_state, normalize_facebook_page_url, parse_donation_amount,
+        parse_interaction_command, render_active_events_page, render_crawl_history_detail,
+        render_crawl_history_page, render_donation, render_help, render_operational_alert,
+        render_operational_health, render_payment_account, render_portal_notice_history_detail,
         render_portal_notice_history_page, render_source_page, render_system_report_markdown,
         render_user_feedback_page, retry_delay_seconds, should_archive_as_stale_portal_notice,
     };
@@ -4732,6 +4799,35 @@ mod tests {
         assert_eq!(retry_delay_seconds(1, 30, 900), 30);
         assert_eq!(retry_delay_seconds(2, 30, 900), 60);
         assert_eq!(retry_delay_seconds(30, 30, 900), 900);
+    }
+
+    #[test]
+    fn automatic_review_retries_unavailable_ai_and_skips_expired_posts() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+        let recent = "2026-09-28T12:00:00+00:00";
+        let expired = "2026-09-26T12:00:00+00:00";
+
+        assert_eq!(
+            automatic_review_action(recent, now, None).unwrap(),
+            AutomaticReviewAction::Retry
+        );
+        assert_eq!(
+            automatic_review_action(recent, now, Some(GeminiReviewDecision::Send)).unwrap(),
+            AutomaticReviewAction::Send
+        );
+        assert_eq!(
+            automatic_review_action(recent, now, Some(GeminiReviewDecision::Skip)).unwrap(),
+            AutomaticReviewAction::Skip
+        );
+        assert_eq!(
+            automatic_review_action(expired, now, None).unwrap(),
+            AutomaticReviewAction::Skip
+        );
+        assert_eq!(
+            automatic_review_action(expired, now, Some(GeminiReviewDecision::Send)).unwrap(),
+            AutomaticReviewAction::Skip
+        );
+        assert!(automatic_review_action("invalid", now, None).is_err());
     }
 
     #[test]

@@ -3147,6 +3147,41 @@ impl CrawlStore {
         if actor_chat_id != authorized_admin_chat_id {
             bail!("manual review action is restricted to the configured administrator");
         }
+        self.resolve_review(
+            classification_id,
+            actor_chat_id,
+            action,
+            reason,
+            notification,
+        )
+        .await
+    }
+
+    pub async fn resolve_ai_review(
+        &self,
+        classification_id: i64,
+        action: ManualReviewAction,
+        reason: &str,
+        notification: Option<ManualReviewNotification<'_>>,
+    ) -> Result<ManualReviewResolutionOutcome> {
+        if reason.trim().is_empty() {
+            bail!("AI review reason must not be empty");
+        }
+        self.resolve_review(classification_id, 0, action, Some(reason), notification)
+            .await
+    }
+
+    async fn resolve_review(
+        &self,
+        classification_id: i64,
+        reviewer_chat_id: i64,
+        action: ManualReviewAction,
+        reason: Option<&str>,
+        notification: Option<ManualReviewNotification<'_>>,
+    ) -> Result<ManualReviewResolutionOutcome> {
+        if classification_id <= 0 {
+            bail!("review classification ID must be positive");
+        }
         let reason = reason.map(str::trim).filter(|value| !value.is_empty());
         if reason.is_some_and(|value| value.chars().count() > 1_000) {
             bail!("manual review reason exceeds 1000 characters");
@@ -3201,7 +3236,7 @@ impl CrawlStore {
                  VALUES ($1, 'skip', $2, 'post already has a notification campaign')",
             )
             .bind(classification_id)
-            .bind(actor_chat_id)
+            .bind(reviewer_chat_id)
             .execute(&mut *transaction)
             .await?;
             transaction.commit().await?;
@@ -3220,7 +3255,7 @@ impl CrawlStore {
         )
         .bind(classification_id)
         .bind(action_name)
-        .bind(actor_chat_id)
+        .bind(reviewer_chat_id)
         .bind(reason)
         .execute(&mut *transaction)
         .await?;
@@ -4112,6 +4147,37 @@ impl CrawlStore {
             retry_delay_seconds,
         )
         .await
+    }
+
+    pub async fn defer_notification_event_for_ai(
+        &self,
+        event: &ClaimedNotificationEvent,
+        owner: &str,
+        error: &str,
+        retry_delay_seconds: u64,
+    ) -> Result<FailureDisposition> {
+        if owner.is_empty() || retry_delay_seconds == 0 {
+            bail!("AI review retry owner and delay must be valid");
+        }
+        let error = error.chars().take(4_000).collect::<String>();
+        let affected = sqlx::query(
+            "UPDATE outbox_events SET lease_owner = NULL, lease_expires_at = NULL, \
+                available_at = CURRENT_TIMESTAMP + make_interval(secs => $3::double precision), \
+                last_error = $4 \
+             WHERE id = $1 AND lease_owner = $2 AND processed_at IS NULL \
+               AND event_type = 'classification.completed'",
+        )
+        .bind(event.id)
+        .bind(owner)
+        .bind(i64::try_from(retry_delay_seconds)?)
+        .bind(error)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            bail!("failed to defer notification event for AI review");
+        }
+        Ok(FailureDisposition::RetryScheduled)
     }
 
     pub async fn prepare_due_digests(&self, limit: i64) -> Result<DigestPreparationOutcome> {

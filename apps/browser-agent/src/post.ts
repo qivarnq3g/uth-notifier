@@ -4,6 +4,8 @@ import { isIP } from "node:net";
 import { pathToFileURL } from "node:url";
 import { chromium, type Response } from "playwright-core";
 
+import { chromiumLaunchOptions } from "./browser-runtime.ts";
+
 const searchUserAgent =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
@@ -1091,24 +1093,25 @@ async function responseRemoteFamily(
 
 async function captureSnapshot(
   sourceUrl: string,
-  executablePath: string,
+  executablePath: string | undefined,
   network: BrowserNetworkSelection,
 ): Promise<BrowserSnapshot> {
   const startedAt = Date.now();
-  const browser = await chromium.launch({
-    executablePath,
-    headless: true,
-    args: [
-      ...chromiumCrashReportingArgs,
-      "--disable-background-networking",
-      "--disable-component-update",
-      "--disable-default-apps",
-      "--disable-extensions",
-      "--disable-sync",
-      "--no-first-run",
-      ...chromiumNetworkArgs(network.ipv4Address),
-    ],
-  });
+  const browser = await chromium.launch(
+    chromiumLaunchOptions(
+      [
+        ...chromiumCrashReportingArgs,
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-extensions",
+        "--disable-sync",
+        "--no-first-run",
+        ...chromiumNetworkArgs(network.ipv4Address),
+      ],
+      executablePath,
+    ),
+  );
   try {
     const context = await browser.newContext({
       userAgent: searchUserAgent,
@@ -1227,9 +1230,7 @@ async function captureSnapshot(
 
 async function main(): Promise<void> {
   const sourceUrl = process.argv[2];
-  const executablePath =
-    process.env.CHROME_PATH ??
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+  const executablePath = process.env.CHROME_PATH;
   if (!sourceUrl) {
     throw new Error("usage: post.ts <facebook-page-url>");
   }

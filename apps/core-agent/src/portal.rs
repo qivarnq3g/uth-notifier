@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -68,6 +69,31 @@ impl fmt::Display for PortalHttpError {
 }
 
 impl std::error::Error for PortalHttpError {}
+
+#[derive(Debug)]
+struct PortalAttachmentUnavailable(String);
+
+impl fmt::Display for PortalAttachmentUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PortalAttachmentUnavailable {}
+
+fn attachment_unavailable(detail: impl Into<String>) -> anyhow::Error {
+    PortalAttachmentUnavailable(detail.into()).into()
+}
+
+pub fn is_attachment_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<PortalAttachmentUnavailable>())
+}
+
+fn attachment_status_is_permanent(status: reqwest::StatusCode) -> bool {
+    status.is_client_error() && !matches!(status.as_u16(), 408 | 429)
+}
 
 #[derive(Clone)]
 pub struct PortalClient {
@@ -158,31 +184,37 @@ impl PortalClient {
         Ok(ids)
     }
 
-    pub async fn notice_ids_after(
+    pub async fn unobserved_notice_ids<F, Fut>(
         &self,
-        last_seen_portal_id: i64,
         page_size: usize,
         max_pages: usize,
-    ) -> Result<Vec<i64>> {
-        if last_seen_portal_id < 0 || page_size == 0 || max_pages == 0 {
+        mut unobserved: F,
+    ) -> Result<Vec<i64>>
+    where
+        F: FnMut(Vec<i64>) -> Fut,
+        Fut: Future<Output = Result<Vec<i64>>>,
+    {
+        if page_size == 0 || max_pages == 0 {
             bail!("Portal scan parameters are invalid");
         }
-        let mut notices = BTreeMap::new();
-        let mut reached_boundary = false;
+        let mut discovered = BTreeSet::new();
         for page_number in 1..=max_pages {
             let page = self.fetch_page(page_number, page_size).await?;
-            let empty = page.content.is_empty();
-            for item in page.content {
-                if item.id == last_seen_portal_id {
-                    reached_boundary = true;
-                    break;
-                }
-                if item.id > 0 {
-                    notices.insert(item.id, ());
-                }
+            let listed = page
+                .content
+                .into_iter()
+                .map(|item| item.id)
+                .filter(|id| *id > 0)
+                .collect::<BTreeSet<_>>();
+            if listed.is_empty() {
+                return Ok(discovered.into_iter().collect());
             }
-            if reached_boundary || empty || page_number >= page.total_pages {
-                return Ok(notices.into_keys().collect());
+            let listed_count = listed.len();
+            let new_ids = unobserved(listed.into_iter().collect()).await?;
+            let reached_observed = new_ids.len() < listed_count;
+            discovered.extend(new_ids);
+            if reached_observed || page_number >= page.total_pages {
+                return Ok(discovered.into_iter().collect());
             }
         }
         bail!("Portal notice scan exceeded the configured page limit")
@@ -200,24 +232,20 @@ impl PortalClient {
         if !envelope.success || envelope.body.id != portal_id {
             bail!("Portal returned an invalid notice detail");
         }
-        let title = envelope.body.tieu_de.trim().to_owned();
-        if title.is_empty() || title.chars().count() > 1_000 {
-            bail!("Portal notice title is invalid");
-        }
+        let title = portal_notice_title(portal_id, &envelope.body.tieu_de);
         let article_url = extract_first_https_link(&envelope.body.noi_dung);
         let attachment_url = envelope
             .body
             .noi_dung_url
             .as_deref()
-            .map(validate_attachment_url)
-            .transpose()?
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| validate_attachment_url(value).ok())
             .map(|url| url.to_string());
-        let attachment_content_type = envelope
-            .body
-            .noi_dung_file_type
-            .as_deref()
-            .map(normalize_content_type)
-            .transpose()?;
+        let attachment_content_type = attachment_url
+            .as_ref()
+            .and(envelope.body.noi_dung_file_type.as_deref())
+            .and_then(|value| normalize_content_type(value).ok());
         Ok(PortalNotice {
             portal_id,
             title,
@@ -237,22 +265,32 @@ impl PortalClient {
         if portal_id <= 0 {
             bail!("Portal notice ID must be positive");
         }
-        let url = validate_attachment_url(raw_url)?;
+        let url = validate_attachment_url(raw_url)
+            .map_err(|error| attachment_unavailable(format!("{error:#}")))?;
         let mut response = self
             .client
             .get(url)
             .timeout(self.file_timeout)
             .send()
             .await
-            .context("failed to download Portal attachment")?
-            .error_for_status()
-            .context("Portal attachment returned an error status")?;
-        let final_url = validate_attachment_url(response.url().as_str())?;
+            .context("failed to download Portal attachment")?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = format!("Portal attachment returned HTTP {status}");
+            if attachment_status_is_permanent(status) {
+                return Err(attachment_unavailable(detail));
+            }
+            bail!(detail);
+        }
+        let final_url = validate_attachment_url(response.url().as_str())
+            .map_err(|error| attachment_unavailable(format!("{error:#}")))?;
         if response
             .content_length()
             .is_some_and(|length| length > self.max_file_bytes as u64)
         {
-            bail!("Portal attachment exceeds the Telegram file-size limit");
+            return Err(attachment_unavailable(
+                "Portal attachment exceeds the Telegram file-size limit",
+            ));
         }
         let response_content_type = response
             .headers()
@@ -264,9 +302,12 @@ impl PortalClient {
         let content_type = response_content_type
             .or(expected_content_type)
             .unwrap_or("application/octet-stream");
-        let content_type = normalize_content_type(content_type)?;
+        let content_type = normalize_content_type(content_type)
+            .map_err(|error| attachment_unavailable(format!("{error:#}")))?;
         if matches!(content_type.as_str(), "text/html" | "application/json") {
-            bail!("Portal attachment returned a non-file content type");
+            return Err(attachment_unavailable(
+                "Portal attachment returned a non-file content type",
+            ));
         }
         let disposition = response
             .headers()
@@ -286,12 +327,14 @@ impl PortalClient {
             .context("failed to read Portal attachment")?
         {
             if chunk.len() > self.max_file_bytes.saturating_sub(bytes.len()) {
-                bail!("Portal attachment exceeds the Telegram file-size limit");
+                return Err(attachment_unavailable(
+                    "Portal attachment exceeds the Telegram file-size limit",
+                ));
             }
             bytes.extend_from_slice(&chunk);
         }
         if bytes.is_empty() {
-            bail!("Portal attachment is empty");
+            return Err(attachment_unavailable("Portal attachment is empty"));
         }
         Ok(PortalAttachment {
             bytes,
@@ -491,6 +534,14 @@ pub fn render_portal_notification(notice: &PortalNotice) -> String {
     format!("{header}\n\n{title}{footer}")
 }
 
+fn portal_notice_title(portal_id: i64, raw: &str) -> String {
+    let title = raw.trim();
+    if title.is_empty() {
+        return format!("Thông báo Portal #{portal_id}");
+    }
+    truncate_chars(title, 1_000)
+}
+
 fn validate_api_base(url: &Url) -> Result<()> {
     if !url.username().is_empty() || url.password().is_some() || url.cannot_be_a_base() {
         bail!("Portal API base URL is invalid");
@@ -674,17 +725,20 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use chrono::TimeZone;
+    use reqwest::StatusCode;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use url::Url;
 
     use super::{
-        PortalClient, PortalFailureKind, PortalNotice, attachment_file_name, classify_portal_error,
-        extract_first_daotao_pdf_link, extract_first_https_link, render_portal_notification,
-        validate_attachment_url,
+        PortalClient, PortalFailureKind, PortalNotice, attachment_file_name,
+        attachment_status_is_permanent, attachment_unavailable, classify_portal_error,
+        extract_first_daotao_pdf_link, extract_first_https_link, is_attachment_unavailable,
+        render_portal_notification, validate_attachment_url,
     };
 
     #[tokio::test]
@@ -759,58 +813,121 @@ mod tests {
         assert!(requests[0].starts_with("GET /notification?page=1&size=20"));
     }
 
+    fn known_notices(
+        known: &[i64],
+    ) -> impl FnMut(Vec<i64>) -> std::future::Ready<anyhow::Result<Vec<i64>>> {
+        let known = known.iter().copied().collect::<BTreeSet<_>>();
+        move |ids| {
+            std::future::ready(Ok(ids
+                .into_iter()
+                .filter(|id| !known.contains(id))
+                .collect()))
+        }
+    }
+
     #[tokio::test]
     async fn catches_up_every_id_across_bounded_pages_in_ascending_order() {
         let (base_url, server) = mock_server(vec![
             (
                 200,
-                r#"{"success":true,"body":{"content":[{"id":105},{"id":104}],"totalPages":2}}"#,
+                r#"{"success":true,"body":{"content":[{"id":105},{"id":104}],"totalPages":3}}"#,
             ),
             (
                 200,
-                r#"{"success":true,"body":{"content":[{"id":103},{"id":102}],"totalPages":2}}"#,
+                r#"{"success":true,"body":{"content":[{"id":103},{"id":102}],"totalPages":3}}"#,
             ),
         ])
         .await;
-        let client = PortalClient::new(
-            Url::parse(&base_url).unwrap(),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            1024,
-        )
-        .unwrap();
+        let client = portal_client(&base_url);
 
         assert_eq!(
-            client.notice_ids_after(103, 2, 2).await.unwrap(),
-            vec![104, 105]
+            client
+                .unobserved_notice_ids(2, 3, known_notices(&[102]))
+                .await
+                .unwrap(),
+            vec![103, 104, 105]
         );
         let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /notification?page=1&size=2"));
         assert!(requests[1].starts_with("GET /notification?page=2&size=2"));
     }
 
     #[tokio::test]
-    async fn catches_up_when_feed_ids_are_not_monotonic() {
+    async fn finds_new_notices_listed_after_an_observed_notice() {
         let (base_url, server) = mock_server(vec![(
             200,
-            r#"{"success":true,"body":{"content":[{"id":1443},{"id":1444}],"totalPages":1}}"#,
+            r#"{"success":true,"body":{"content":[{"id":1443},{"id":1444}],"totalPages":9}}"#,
         )])
         .await;
-        let client = PortalClient::new(
-            Url::parse(&base_url).unwrap(),
+        let client = portal_client(&base_url);
+
+        assert_eq!(
+            client
+                .unobserved_notice_ids(2, 5, known_notices(&[1443]))
+                .await
+                .unwrap(),
+            vec![1444]
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stops_on_an_observed_page_even_when_the_cursor_notice_disappeared() {
+        let (base_url, server) = mock_server(vec![(
+            200,
+            r#"{"success":true,"body":{"content":[{"id":1499},{"id":1498}],"totalPages":90}}"#,
+        )])
+        .await;
+        let client = portal_client(&base_url);
+
+        assert!(
+            client
+                .unobserved_notice_ids(2, 20, known_notices(&[1498, 1499]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_a_notice_when_its_attachment_metadata_is_unusable() {
+        let long_title = "T".repeat(1_200);
+        let body = format!(
+            r#"{{"success":true,"body":{{"id":321,"tieuDe":"{long_title}","noiDung":"","ngayHienThi":"2026-07-27T03:00:00Z","noiDungUrl":"","noiDungFileType":""}}}}"#
+        );
+        let (base_url, server) = mock_server(vec![(200, body.leak())]).await;
+        let client = portal_client(&base_url);
+
+        let notice = client.fetch_notice(321).await.unwrap();
+        assert_eq!(notice.title.chars().count(), 1_000);
+        assert_eq!(notice.attachment_url, None);
+        assert_eq!(notice.attachment_content_type, None);
+        server.await.unwrap();
+
+        let (base_url, server) = mock_server(vec![(
+            200,
+            r#"{"success":true,"body":{"id":322,"tieuDe":"  ","noiDung":"","ngayHienThi":"2026-07-27T03:00:00Z","noiDungUrl":"https://drive.example.com/file.pdf","noiDungFileType":"application/pdf"}}"#,
+        )])
+        .await;
+        let notice = portal_client(&base_url).fetch_notice(322).await.unwrap();
+        assert_eq!(notice.title, "Thông báo Portal #322");
+        assert_eq!(notice.attachment_url, None);
+        assert_eq!(notice.attachment_content_type, None);
+        server.await.unwrap();
+    }
+
+    fn portal_client(base_url: &str) -> PortalClient {
+        PortalClient::new(
+            Url::parse(base_url).unwrap(),
             Duration::from_secs(2),
             Duration::from_secs(2),
             1024,
         )
-        .unwrap();
-
-        assert_eq!(
-            client.notice_ids_after(1444, 2, 1).await.unwrap(),
-            vec![1443]
-        );
-        let requests = server.await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("GET /notification?page=1&size=2"));
+        .unwrap()
     }
 
     #[tokio::test]
@@ -844,6 +961,23 @@ mod tests {
         );
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("GET /notification/321"));
+    }
+
+    #[test]
+    fn only_permanent_attachment_failures_skip_the_retry_budget() {
+        assert!(attachment_status_is_permanent(StatusCode::NOT_FOUND));
+        assert!(attachment_status_is_permanent(StatusCode::GONE));
+        assert!(!attachment_status_is_permanent(StatusCode::REQUEST_TIMEOUT));
+        assert!(!attachment_status_is_permanent(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!attachment_status_is_permanent(StatusCode::BAD_GATEWAY));
+        assert!(is_attachment_unavailable(
+            &attachment_unavailable("Portal attachment is empty").context("delivery")
+        ));
+        assert!(!is_attachment_unavailable(&anyhow::anyhow!(
+            "failed to download Portal attachment"
+        )));
     }
 
     #[test]

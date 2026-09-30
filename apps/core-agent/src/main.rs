@@ -24,7 +24,10 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use url::Url;
-use uth_crawler::facebook::{DEFAULT_MINIMUM_YIELD, STRATEGIES, diff_posts, probe};
+use uth_crawler::facebook::{
+    DEFAULT_MINIMUM_YIELD, STRATEGIES, diff_posts, page_slug, probe,
+    source_id as facebook_source_id,
+};
 use uth_domain::CrawlReport;
 use uth_storage::{
     AdaptiveSchedule, ClaimedSource, CrawlStore, PersistOutcome, ScheduledPersistOptions,
@@ -34,6 +37,8 @@ use uth_storage::{
 use crate::strategy_circuit::{
     StrategyCircuitBreaker, StrategyCircuitPolicy, StrategyCircuitSnapshot, StrategySelection,
 };
+
+const SUGGESTED_SOURCE_KEY_PREFIX: &str = "facebook:suggestion:";
 
 #[cfg(unix)]
 struct SchedulerShutdownSignals {
@@ -1107,11 +1112,42 @@ async fn crawl_batch_source(
 }
 
 fn facebook_crawl_target(source_key: &str, configured_url: &str) -> Result<FacebookCrawlTarget> {
-    let expected_source_id = facebook_source_key(source_key);
-    let numeric_id = expected_source_id
-        .strip_prefix("facebook:")
-        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .context("Facebook source key must contain a verified numeric page ID")?;
+    let source_key = facebook_source_key(source_key);
+    if source_key.starts_with(SUGGESTED_SOURCE_KEY_PREFIX) {
+        return suggested_facebook_crawl_target(configured_url);
+    }
+    numeric_facebook_crawl_target(&source_key, configured_url)
+}
+
+fn suggested_facebook_crawl_target(configured_url: &str) -> Result<FacebookCrawlTarget> {
+    validate_facebook_source_url(configured_url)?;
+    let identity =
+        page_slug(configured_url).context("suggested Facebook source URL has no page identity")?;
+    if identity.bytes().all(|byte| byte.is_ascii_digit()) {
+        return numeric_facebook_crawl_target(&format!("facebook:{identity}"), configured_url);
+    }
+    let parsed = Url::parse(configured_url).context("configured Facebook source URL is invalid")?;
+    let is_single_alias_segment = parsed
+        .path_segments()
+        .is_some_and(|segments| segments.filter(|segment| !segment.is_empty()).count() == 1);
+    if !is_single_alias_segment
+        || matches!(
+            identity.to_ascii_lowercase().as_str(),
+            "people" | "pages" | "profile.php" | "groups"
+        )
+    {
+        bail!("suggested Facebook source URL must identify a public page");
+    }
+    Ok(FacebookCrawlTarget {
+        configured_url: configured_url.to_owned(),
+        presentation_url: configured_url.to_owned(),
+        fallback_url: None,
+        presentation_kind: "suggested_alias_route",
+        expected_source_id: facebook_source_id(configured_url)?,
+    })
+}
+
+fn validate_facebook_source_url(configured_url: &str) -> Result<()> {
     let parsed = Url::parse(configured_url).context("configured Facebook source URL is invalid")?;
     let host = parsed
         .host_str()
@@ -1128,6 +1164,20 @@ fn facebook_crawl_target(source_key: &str, configured_url: &str) -> Result<Faceb
     {
         bail!("configured source must be an unauthenticated HTTPS Facebook URL");
     }
+    Ok(())
+}
+
+fn numeric_facebook_crawl_target(
+    source_key: &str,
+    configured_url: &str,
+) -> Result<FacebookCrawlTarget> {
+    let expected_source_id = facebook_source_key(source_key);
+    let numeric_id = expected_source_id
+        .strip_prefix("facebook:")
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .context("Facebook source key must contain a verified numeric page ID")?;
+    validate_facebook_source_url(configured_url)?;
+    let parsed = Url::parse(configured_url).context("configured Facebook source URL is invalid")?;
     let configured_numeric_route = parsed
         .path_segments()
         .map(|segments| segments.collect::<Vec<_>>())
@@ -1541,6 +1591,52 @@ mod tests {
                 "http://www.facebook.com/clbangdtt/"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn approved_suggestions_crawl_their_submitted_page() {
+        let alias = facebook_crawl_target(
+            "facebook:suggestion:7",
+            "https://www.facebook.com/ITClubUTH/",
+        )
+        .unwrap();
+        assert_eq!(
+            alias.presentation_url,
+            "https://www.facebook.com/ITClubUTH/"
+        );
+        assert_eq!(alias.fallback_url, None);
+        assert_eq!(alias.presentation_kind, "suggested_alias_route");
+        assert_eq!(alias.expected_source_id, "facebook:itclubuth");
+
+        let people = facebook_crawl_target(
+            "facebook:suggestion:8",
+            "https://www.facebook.com/people/Test-Page/61566022178073/",
+        )
+        .unwrap();
+        assert_eq!(people.presentation_kind, "configured_numeric_route");
+        assert_eq!(people.expected_source_id, "facebook:61566022178073");
+
+        let profile = facebook_crawl_target(
+            "facebook:suggestion:9",
+            "https://www.facebook.com/profile.php?id=100064352813128",
+        )
+        .unwrap();
+        assert_eq!(profile.presentation_kind, "numeric_profile");
+        assert_eq!(profile.expected_source_id, "facebook:100064352813128");
+    }
+
+    #[test]
+    fn rejects_suggestions_that_do_not_identify_a_public_page() {
+        assert!(
+            facebook_crawl_target(
+                "facebook:suggestion:10",
+                "https://www.facebook.com/groups/example/"
+            )
+            .is_err()
+        );
+        assert!(
+            facebook_crawl_target("facebook:suggestion:11", "https://example.com/page/").is_err()
         );
     }
 

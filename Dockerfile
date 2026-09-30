@@ -26,7 +26,8 @@ WORKDIR /app
 
 COPY --from=rust-builder /build/target/release/uth-agent /usr/local/bin/uth-agent
 COPY --from=browser-dependencies /build/apps/browser-agent/node_modules ./apps/browser-agent/node_modules
-COPY apps/browser-agent/src/post.ts ./apps/browser-agent/src/post.ts
+COPY apps/browser-agent/package.json ./apps/browser-agent/package.json
+COPY apps/browser-agent/src ./apps/browser-agent/src
 COPY config/classifier-rules.v1.json ./config/classifier-rules.v1.json
 COPY deploy/server-entrypoint.sh /usr/local/bin/server-entrypoint
 

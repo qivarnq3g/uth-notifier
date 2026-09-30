@@ -74,7 +74,10 @@ jobs:
 
       - name: Build runtime bundle
         run: |
-          stage=target/runtime-linux-amd64
+          # Stage outside target/: rust-cache restores target/, and a stale
+          # stage makes `cp -a` nest dist/, config/ and deploy/ one level deep.
+          stage="$RUNNER_TEMP/runtime-linux-amd64"
+          rm -rf "$stage"
           install -Dm755 target/release/uth-agent "$stage/bin/uth-agent"
           cp -a config "$stage/config"
           cp -a deploy "$stage/deploy"

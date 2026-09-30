@@ -9,6 +9,6 @@
     "d1:migrate:remote": "wrangler d1 migrations apply uth-notifier-edge --remote"
   },
   "devDependencies": {
-    "wrangler": "4.132.0"
+    "wrangler": "4.144.0"
   }
 }

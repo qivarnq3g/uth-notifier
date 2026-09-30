@@ -10,7 +10,7 @@ Group=postgres
 Environment=POSTGRES_DB=uth_notifier
 Environment=BACKUP_DIRECTORY=/var/backups/uth-notifier
 Environment=BACKUP_RETENTION_DAYS=14
-ExecStart=/opt/uth-notifier/current/deploy/backup-native.sh
+ExecStart=/bin/sh /opt/uth-notifier/current/deploy/backup-native.sh
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

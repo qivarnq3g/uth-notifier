@@ -4023,6 +4023,23 @@ impl CrawlStore {
         Ok(updated)
     }
 
+    pub async fn drop_portal_campaign_attachment(&self, campaign_id: i64) -> Result<bool> {
+        if campaign_id <= 0 {
+            bail!("campaign ID must be positive");
+        }
+        Ok(sqlx::query(
+            "UPDATE campaigns SET attachment_url = NULL, attachment_file_name = NULL, \
+                attachment_content_type = NULL \
+             WHERE id = $1 AND portal_notice_id IS NOT NULL AND attachment_url IS NOT NULL \
+               AND telegram_file_id IS NULL",
+        )
+        .bind(campaign_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
     pub async fn plan_notification(
         &self,
         event: &ClaimedNotificationEvent,
@@ -4410,7 +4427,7 @@ impl CrawlStore {
                   AND (subscribers.active OR (campaign.portal_notice_id IS NOT NULL \
                        AND subscribers.deactivated_reason = $4)) \
                   AND subscribers.next_send_at <= CURRENT_TIMESTAMP \
-                  AND (campaign.portal_notice_id IS NULL OR campaign.telegram_file_id IS NOT NULL \
+                  AND (campaign.attachment_url IS NULL OR campaign.telegram_file_id IS NOT NULL \
                        OR delivery.id = ( \
                            SELECT seed.id FROM deliveries AS seed \
                            JOIN subscribers AS seed_subscriber \

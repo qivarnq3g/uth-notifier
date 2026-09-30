@@ -108,6 +108,9 @@ services:
       PAYOS_CHECKSUM_KEY: ${PAYOS_CHECKSUM_KEY:-}
       PAYOS_RETURN_URL: ${PAYOS_RETURN_URL:-}
       PAYOS_CANCEL_URL: ${PAYOS_CANCEL_URL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_FALLBACK_API_KEY: ${GEMINI_FALLBACK_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
     tmpfs:
       - /tmp:size=64m,mode=1777
     mem_limit: 256m

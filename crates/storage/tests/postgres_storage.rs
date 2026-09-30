@@ -1416,6 +1416,81 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
 
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
+async fn unavailable_portal_attachment_falls_back_to_parallel_text_delivery() {
+    let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let store = CrawlStore::connect(&database_url, 2).await.unwrap();
+    store.migrate().await.unwrap();
+    sqlx::query(
+        "TRUNCATE portal_notice_state, portal_notices, subscribers RESTART IDENTITY CASCADE",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for chat_id in [201, 202, 203] {
+        store.upsert_subscriber(chat_id, None).await.unwrap();
+    }
+    assert!(store.initialize_portal_notice_cursor(299).await.unwrap());
+    let outcome = store
+        .plan_portal_notice(
+            &PortalNoticeRecord {
+                portal_id: 300,
+                title: "Thông báo có tệp không tải được",
+                displayed_at: Utc::now(),
+                article_url: Some("https://daotao.ut.edu.vn/thong-bao/300"),
+                attachment_url: Some("https://portal.ut.edu.vn/api/v1/notification/getFile/300"),
+                attachment_file_name: None,
+                attachment_content_type: Some("application/pdf"),
+            },
+            "Thông báo bắt buộc từ Portal UTH",
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.deliveries_created, 3);
+
+    let owner = "portal-fallback-worker";
+    let seed_batch = store.claim_deliveries(owner, 10, 60).await.unwrap();
+    assert_eq!(seed_batch.len(), 1);
+    let seed = &seed_batch[0];
+    assert!(seed.attachment_url.is_some());
+    assert!(
+        store
+            .drop_portal_campaign_attachment(seed.campaign_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .drop_portal_campaign_attachment(seed.campaign_id)
+            .await
+            .unwrap()
+    );
+    store
+        .complete_delivery(seed, owner, 900, None)
+        .await
+        .unwrap();
+
+    let remaining = store.claim_deliveries(owner, 10, 60).await.unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining
+            .iter()
+            .all(|delivery| delivery.attachment_url.is_none())
+    );
+    let archived_attachment: Option<String> =
+        sqlx::query_scalar("SELECT attachment_url FROM portal_notices WHERE portal_id = 300")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(archived_attachment.is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
 async fn donation_payments_are_validated_and_idempotent() {
     let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
     let pool = PgPoolOptions::new()
@@ -1508,6 +1583,47 @@ async fn donation_payments_are_validated_and_idempotent() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
+async fn payos_edge_events_accept_multiple_transactions_for_one_order() {
+    let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let store = CrawlStore::connect(&database_url, 2).await.unwrap();
+    store.migrate().await.unwrap();
+    sqlx::query("TRUNCATE edge_inbox_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let payment = |reference: &str| EdgeEvent {
+        schema_version: EDGE_EVENT_SCHEMA_VERSION.to_owned(),
+        event_id: format!("payos:payment-link-1:{reference}"),
+        event_type: "payos.payment".to_owned(),
+        aggregate_key: "payos-order:7".to_owned(),
+        sequence: 7,
+        occurred_at: "2026-09-30T00:00:00Z".to_owned(),
+        payload: serde_json::json!({"orderCode": 7, "reference": reference}),
+    };
+
+    let imported = store
+        .import_edge_events(&[payment("REF-1"), payment("REF-2")])
+        .await
+        .unwrap();
+    assert_eq!(imported.imported, 2);
+    assert_eq!(
+        store
+            .import_edge_events(&[payment("REF-2")])
+            .await
+            .unwrap()
+            .duplicates,
+        1
+    );
+    assert_eq!(store.pending_payos_edge_events(10).await.unwrap().len(), 2);
 }
 
 async fn make_due(pool: &sqlx::PgPool) {

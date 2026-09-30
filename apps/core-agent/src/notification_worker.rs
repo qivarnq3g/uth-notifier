@@ -27,7 +27,7 @@ use crate::gemini_reviewer::{GeminiReviewDecision, GeminiReviewerClient};
 use crate::payos::PayOsClient;
 use crate::portal::{
     PortalAttachment, PortalClient, PortalFailureKind, PortalNotice, TELEGRAM_DOCUMENT_LIMIT,
-    classify_portal_error, render_portal_notification,
+    classify_portal_error, is_attachment_unavailable, render_portal_notification,
 };
 
 const DONATION_AMOUNT_INPUT_TTL_SECONDS: i64 = 600;
@@ -124,10 +124,10 @@ pub struct NotifyArgs {
     payos_api_base: url::Url,
 
     #[arg(long, env = "PAYOS_RETURN_URL")]
-    payos_return_url: Option<url::Url>,
+    payos_return_url: Option<String>,
 
     #[arg(long, env = "PAYOS_CANCEL_URL")]
-    payos_cancel_url: Option<url::Url>,
+    payos_cancel_url: Option<String>,
 
     #[arg(long, env = "GEMINI_API_KEY", hide_env_values = true)]
     pub gemini_api_key: Option<String>,
@@ -395,6 +395,8 @@ struct PortalCycleReport {
     baseline_initialized: bool,
     history_archived: usize,
     notices_found: usize,
+    notices_skipped: usize,
+    skipped_notice_error: Option<String>,
     notices_created: usize,
     campaigns_created: usize,
     deliveries_created: u64,
@@ -524,31 +526,17 @@ pub async fn run(args: NotifyArgs) -> Result<()> {
     let max_connections = u32::try_from(args.concurrency.saturating_add(3))?;
     let store = CrawlStore::connect(&args.database_url, max_connections).await?;
     store.migrate().await?;
-    let payos = match (
-        args.payos_client_id.clone(),
-        args.payos_api_key.clone(),
-        args.payos_checksum_key.clone(),
-        args.payos_return_url.clone(),
-        args.payos_cancel_url.clone(),
-    ) {
-        (
-            Some(client_id),
-            Some(api_key),
-            Some(checksum_key),
-            Some(return_url),
-            Some(cancel_url),
-        ) => Some(PayOsClient::new(
-            client_id,
-            api_key,
-            checksum_key,
-            args.payos_api_base.clone(),
-            return_url,
-            cancel_url,
-            Duration::from_secs(args.request_timeout),
-        )?),
-        (None, None, None, None, None) => None,
-        _ => bail!("all payOS credentials and return URLs must be configured together"),
-    };
+    let payos = payos_client(
+        PayOsSettings {
+            client_id: args.payos_client_id.as_deref(),
+            api_key: args.payos_api_key.as_deref(),
+            checksum_key: args.payos_checksum_key.as_deref(),
+            return_url: args.payos_return_url.as_deref(),
+            cancel_url: args.payos_cancel_url.as_deref(),
+        },
+        &args.payos_api_base,
+        Duration::from_secs(args.request_timeout),
+    )?;
     let primary_gemini_api_key = normalized_optional_value(args.gemini_api_key.as_deref());
     let fallback_gemini_api_key =
         normalized_optional_value(args.gemini_fallback_api_key.as_deref());
@@ -1100,24 +1088,28 @@ async fn run_portal_cycle(
     let result = async {
         report.history_archived =
             archive_recent_portal_history_if_empty(store, portal, &mut report).await?;
-        let Some(cursor) = store.portal_notice_cursor().await? else {
+        if store.portal_notice_cursor().await?.is_none() {
             let latest_portal_id = portal.latest_portal_id(1).await?;
             report.baseline_initialized = store
                 .initialize_portal_notice_cursor(latest_portal_id)
                 .await?;
             return Result::<()>::Ok(());
-        };
-        let latest_portal_id = portal.latest_portal_id(1).await?;
-        if latest_portal_id == cursor || store.portal_notice_exists(latest_portal_id).await? {
-            return Ok(());
         }
         let notice_ids = portal
-            .notice_ids_after(cursor, args.portal_page_size, args.portal_max_pages)
+            .unobserved_notice_ids(
+                args.portal_page_size,
+                args.portal_max_pages,
+                move |ids: Vec<i64>| async move { store.unobserved_portal_notice_ids(&ids).await },
+            )
             .await?;
-        report.notices_found = notice_ids.len();
         let now = Utc::now();
         for portal_id in notice_ids {
-            let mut notice = portal.fetch_notice(portal_id).await?;
+            let Some(mut notice) =
+                fetch_portal_notice_or_skip(portal, portal_id, &mut report).await?
+            else {
+                continue;
+            };
+            report.notices_found += 1;
             enrich_portal_notice_attachment(portal, &mut notice, &mut report).await;
             let record = PortalNoticeRecord {
                 portal_id: notice.portal_id,
@@ -1141,9 +1133,6 @@ async fn run_portal_cycle(
                 let outcome = store.plan_portal_notice(&record, &message_text).await?;
                 accumulate_portal_plan(&mut report, &outcome);
             }
-        }
-        if latest_portal_id > 0 {
-            store.update_portal_notice_cursor(latest_portal_id).await?;
         }
         Ok(())
     }
@@ -1174,7 +1163,9 @@ async fn archive_recent_portal_history_if_empty(
         .await?;
     let mut notices = Vec::with_capacity(portal_ids.len());
     for portal_id in portal_ids {
-        let mut notice = portal.fetch_notice(portal_id).await?;
+        let Some(mut notice) = fetch_portal_notice_or_skip(portal, portal_id, report).await? else {
+            continue;
+        };
         enrich_portal_notice_attachment(portal, &mut notice, report).await;
         notices.push(notice);
     }
@@ -1195,6 +1186,29 @@ async fn archive_recent_portal_history_if_empty(
         );
     }
     Ok(archived)
+}
+
+async fn fetch_portal_notice_or_skip(
+    portal: &PortalClient,
+    portal_id: i64,
+    report: &mut PortalCycleReport,
+) -> Result<Option<PortalNotice>> {
+    match portal.fetch_notice(portal_id).await {
+        Ok(notice) => Ok(Some(notice)),
+        Err(error) if classify_portal_error(&error).kind == PortalFailureKind::Other => {
+            report.notices_skipped += 1;
+            if report.skipped_notice_error.is_none() {
+                report.skipped_notice_error = Some(
+                    format!("Portal notice #{portal_id}: {error:#}")
+                        .chars()
+                        .take(1_000)
+                        .collect(),
+                );
+            }
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn enrich_portal_notice_attachment(
@@ -4356,6 +4370,33 @@ async fn send_delivery(
                             )
                             .await
                     }
+                    Err(error)
+                        if is_attachment_unavailable(&error)
+                            || delivery.attempt >= max_attempts =>
+                    {
+                        match store
+                            .drop_portal_campaign_attachment(delivery.campaign_id)
+                            .await
+                        {
+                            Ok(_) => {
+                                telegram
+                                    .send_portal_notification(
+                                        delivery.telegram_chat_id,
+                                        &delivery.message_text,
+                                        delivery.post_url.as_deref(),
+                                    )
+                                    .await
+                            }
+                            Err(storage_error) => TelegramSendOutcome::TransientFailure {
+                                detail: format!(
+                                    "{error:#}; failed to drop unavailable Portal attachment: {storage_error:#}"
+                                )
+                                .chars()
+                                .take(1_000)
+                                .collect(),
+                            },
+                        }
+                    }
                     Err(error) => TelegramSendOutcome::TransientFailure {
                         detail: error.to_string().chars().take(1_000).collect(),
                     },
@@ -4545,6 +4586,50 @@ fn normalized_optional_value(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+struct PayOsSettings<'a> {
+    client_id: Option<&'a str>,
+    api_key: Option<&'a str>,
+    checksum_key: Option<&'a str>,
+    return_url: Option<&'a str>,
+    cancel_url: Option<&'a str>,
+}
+
+fn payos_client(
+    settings: PayOsSettings<'_>,
+    api_base: &url::Url,
+    timeout: Duration,
+) -> Result<Option<PayOsClient>> {
+    let credentials = (
+        normalized_optional_value(settings.client_id),
+        normalized_optional_value(settings.api_key),
+        normalized_optional_value(settings.checksum_key),
+    );
+    let (client_id, api_key, checksum_key) = match credentials {
+        (None, None, None) => return Ok(None),
+        (Some(client_id), Some(api_key), Some(checksum_key)) => (client_id, api_key, checksum_key),
+        _ => bail!(
+            "PAYOS_CLIENT_ID, PAYOS_API_KEY, and PAYOS_CHECKSUM_KEY must be configured together"
+        ),
+    };
+    let required_url = |value: Option<&str>, name: &str| -> Result<url::Url> {
+        let value = normalized_optional_value(value)
+            .with_context(|| format!("{name} is required when payOS is configured"))?;
+        url::Url::parse(&value).with_context(|| format!("{name} must be a valid HTTPS URL"))
+    };
+    let return_url = required_url(settings.return_url, "PAYOS_RETURN_URL")?;
+    let cancel_url = required_url(settings.cancel_url, "PAYOS_CANCEL_URL")?;
+    PayOsClient::new(
+        client_id,
+        api_key,
+        checksum_key,
+        api_base.clone(),
+        return_url,
+        cancel_url,
+        timeout,
+    )
+    .map(Some)
 }
 
 fn render_donation(config: &DonationConfig, payos_enabled: bool) -> String {
@@ -4784,14 +4869,15 @@ mod tests {
     };
 
     use super::{
-        AutomaticReviewAction, DonationConfig, InteractionCommand, PortalCycleReport,
-        PortalPollConfig, SUPPORT_GROUP_INVITATION, automatic_review_action, display_bank,
-        next_portal_poll_state, normalize_facebook_page_url, parse_donation_amount,
-        parse_interaction_command, render_active_events_page, render_crawl_history_detail,
-        render_crawl_history_page, render_donation, render_help, render_operational_alert,
-        render_operational_health, render_payment_account, render_portal_notice_history_detail,
-        render_portal_notice_history_page, render_source_page, render_system_report_markdown,
-        render_user_feedback_page, retry_delay_seconds, should_archive_as_stale_portal_notice,
+        AutomaticReviewAction, DonationConfig, InteractionCommand, PayOsSettings,
+        PortalCycleReport, PortalPollConfig, SUPPORT_GROUP_INVITATION, automatic_review_action,
+        display_bank, next_portal_poll_state, normalize_facebook_page_url, parse_donation_amount,
+        parse_interaction_command, payos_client, render_active_events_page,
+        render_crawl_history_detail, render_crawl_history_page, render_donation, render_help,
+        render_operational_alert, render_operational_health, render_payment_account,
+        render_portal_notice_history_detail, render_portal_notice_history_page, render_source_page,
+        render_system_report_markdown, render_user_feedback_page, retry_delay_seconds,
+        should_archive_as_stale_portal_notice,
     };
 
     #[test]
@@ -5389,6 +5475,61 @@ mod tests {
         assert!(payos.contains("chọn một mức gợi ý"));
         assert!(!payos.contains("35.000"));
         assert!(payos.contains("Tùy tâm"));
+    }
+
+    #[test]
+    fn blank_payos_settings_disable_donations_instead_of_failing_startup() {
+        let api_base = url::Url::parse("https://api-merchant.payos.vn").unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        let settings = |client_id, return_url| PayOsSettings {
+            client_id,
+            api_key: client_id,
+            checksum_key: client_id,
+            return_url,
+            cancel_url: return_url,
+        };
+
+        assert!(
+            payos_client(settings(None, None), &api_base, timeout)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            payos_client(
+                settings(Some(" "), Some("https://edge.example/donate/return")),
+                &api_base,
+                timeout
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            payos_client(
+                settings(
+                    Some("configured"),
+                    Some("https://edge.example/donate/return")
+                ),
+                &api_base,
+                timeout
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(payos_client(settings(Some("configured"), Some("")), &api_base, timeout).is_err());
+        assert!(
+            payos_client(
+                PayOsSettings {
+                    api_key: None,
+                    ..settings(
+                        Some("configured"),
+                        Some("https://edge.example/donate/return")
+                    )
+                },
+                &api_base,
+                timeout
+            )
+            .is_err()
+        );
     }
 
     #[test]

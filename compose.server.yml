@@ -149,6 +149,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-uth_notifier}
       POSTGRES_USER: ${POSTGRES_USER:-uth_agent}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_MIN_KEEP: ${BACKUP_MIN_KEEP:-7}
     secrets:
       - postgres_password
     volumes:
@@ -175,6 +176,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-uth_notifier}
       POSTGRES_USER: ${POSTGRES_USER:-uth_agent}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_MIN_KEEP: ${BACKUP_MIN_KEEP:-7}
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
       BACKUP_RETRY_SECONDS: ${BACKUP_RETRY_SECONDS:-300}
     secrets:

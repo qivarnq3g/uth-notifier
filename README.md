@@ -310,7 +310,7 @@ Bố cục trên máy chủ mà các unit trong [`deploy/systemd`](deploy/system
 | `uth-notifier-classifier.service` | `classify`. |
 | `uth-notifier-notify.service` | `notify`. |
 | `uth-notifier-edge-reconciler.service` | `reconcile-edge` (chỉ khi dùng edge). |
-| `uth-notifier-backup.timer` / `.service` | `pg_dump` hằng ngày, giữ 14 ngày. |
+| `uth-notifier-backup.timer` / `.service` | `pg_dump` hằng ngày, giữ 14 ngày và tối thiểu 7 bản. |
 | `uth-notifier-browser-crash-clean.timer` / `.service` | Dọn báo cáo crash của Chromium. |
 
 Các tệp cấu hình đi kèm: [`deploy/tmpfiles.d`](deploy/tmpfiles.d) (vào `/etc/tmpfiles.d/`), [`deploy/journald.conf.d`](deploy/journald.conf.d) (giới hạn dung lượng log) và [`deploy/postgresql-low-memory.conf`](deploy/postgresql-low-memory.conf) (tinh chỉnh PostgreSQL cho máy ít RAM).
@@ -412,8 +412,8 @@ Sau khi deploy:
 
 ### Sao lưu và khôi phục
 
-- **systemd:** [`deploy/backup-native.sh`](deploy/backup-native.sh) tạo bản `pg_dump` định dạng custom kèm `.sha256`, kiểm tra bằng `pg_restore --list`, rồi xoá bản cũ hơn `BACKUP_RETENTION_DAYS` (mặc định 14 ngày).
-- **Docker Compose:** [`deploy/backup.sh`](deploy/backup.sh) và [`deploy/restore.sh`](deploy/restore.sh). Bước khôi phục kiểm tra checksum trước khi chạy `pg_restore --clean`.
+- **systemd:** [`deploy/backup-native.sh`](deploy/backup-native.sh) tạo bản `pg_dump` định dạng custom kèm `.sha256`, kiểm tra bằng `pg_restore --list`, rồi xoá bản cũ hơn `BACKUP_RETENTION_DAYS` (mặc định 14 ngày). Script luôn giữ lại `BACKUP_MIN_KEEP` bản mới nhất (mặc định 7), nên một đợt sao lưu lỗi kéo dài không xoá sạch các bản cũ.
+- **Docker Compose:** [`deploy/backup.sh`](deploy/backup.sh) áp dụng cùng quy tắc giữ bản; [`deploy/restore.sh`](deploy/restore.sh) dùng để khôi phục. Bước khôi phục kiểm tra checksum trước khi chạy `pg_restore --clean`.
 
 ### Thời gian lưu dữ liệu
 

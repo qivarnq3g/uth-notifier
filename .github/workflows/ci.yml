@@ -81,6 +81,7 @@ jobs:
           docker compose --env-file deploy/server.env.example -f compose.server.yml config --quiet
           sh -n deploy/server-entrypoint.sh
           sh -n deploy/backup.sh
+          sh -n deploy/backup-native.sh
           sh -n deploy/backup-loop.sh
           sh -n deploy/restore.sh
           node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('config/facebook-sources.v1.json','utf8'));const ids=x.recommended_sources.map(s=>s.id);if(ids.length!==47||new Set(ids).size!==47)process.exit(1)"

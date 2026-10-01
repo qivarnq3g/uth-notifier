@@ -13,6 +13,7 @@ Dự án ưu tiên **độ chính xác** và **độ bền**: mọi bước xử
 ## Mục lục
 
 - [Tính năng](#tính-năng)
+- [Hình ảnh](#hình-ảnh)
 - [Kiến trúc](#kiến-trúc)
 - [Cấu trúc thư mục](#cấu-trúc-thư-mục)
 - [Bắt đầu nhanh](#bắt-đầu-nhanh)
@@ -48,6 +49,35 @@ Dự án ưu tiên **độ chính xác** và **độ bền**: mọi bước xử
 - **Lịch crawl thích ứng** theo mức độ hoạt động của từng trang, kèm circuit breaker cho từng chiến lược crawl (mặc định ngắt sau 10 lần lỗi, thử lại sau 15 phút).
 - **Chống gửi trùng:** bài được định danh bằng ID số và `content_hash`; mọi worker dùng outbox, lease và thao tác idempotent.
 - **Vận hành gọn:** báo cáo health dạng JSON, sao lưu tự động có kiểm tra checksum, gói release dựng sẵn cho Linux và tự áp dụng migration khi khởi động.
+
+## Hình ảnh
+
+Ảnh chụp bot đang chạy thật trên Telegram Web.
+
+<table>
+  <tr>
+    <td align="center"><img src="assets/screenshots/notify-activity.webp" width="250" alt="Tin thông báo hoạt động sinh viên kèm nút Xem bài gốc, Hữu ích, Không phù hợp"><br><sub>Thông báo hoạt động</sub></td>
+    <td align="center"><img src="assets/screenshots/notify-portal.webp" width="250" alt="Thông báo từ Cổng đào tạo UTH kèm tệp PDF đính kèm"><br><sub>Thông báo Cổng đào tạo kèm tệp</sub></td>
+    <td align="center"><img src="assets/screenshots/03-settings.webp" width="250" alt="Màn hình cài đặt: loại hoạt động, cách nhận tin, giờ yên lặng"><br><sub><code>/settings</code> · Cài đặt nhận tin</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/screenshots/04-events.webp" width="250" alt="Danh sách hoạt động và học bổng đang mở kèm link đăng ký"><br><sub><code>/events</code> · Hoạt động đang mở</sub></td>
+    <td align="center"><img src="assets/screenshots/06-portal-history.webp" width="250" alt="Lịch sử thông báo Portal có đánh dấu tệp đính kèm"><br><sub><code>/portal_history</code> · Lịch sử Portal</sub></td>
+    <td align="center"><img src="assets/screenshots/05-latest.webp" width="250" alt="Danh sách bài Facebook mới nhất được thu thập"><br><sub><code>/latest</code> · Bài mới nhất</sub></td>
+  </tr>
+</table>
+
+<details>
+<summary>Xem thêm: <code>/start</code>, <code>/help</code>, <code>/pages</code></summary>
+<br>
+<table>
+  <tr>
+    <td align="center"><img src="assets/screenshots/01-start.webp" width="250" alt="Trả lời lệnh /start kèm bàn phím chọn cách nhận tin"><br><sub><code>/start</code> · Bắt đầu</sub></td>
+    <td align="center"><img src="assets/screenshots/02-help.webp" width="250" alt="Hướng dẫn sử dụng bot và danh sách lệnh chính"><br><sub><code>/help</code> · Hướng dẫn</sub></td>
+    <td align="center"><img src="assets/screenshots/07-pages.webp" width="250" alt="Danh sách trang Facebook đang được theo dõi"><br><sub><code>/pages</code> · Trang đang theo dõi</sub></td>
+  </tr>
+</table>
+</details>
 
 ## Kiến trúc
 

@@ -394,6 +394,7 @@ struct PortalCycleReport {
     cooldown_reason: Option<String>,
     baseline_initialized: bool,
     history_archived: usize,
+    bodies_backfilled: usize,
     notices_found: usize,
     notices_skipped: usize,
     skipped_notice_error: Option<String>,
@@ -1114,6 +1115,7 @@ async fn run_portal_cycle(
             let record = PortalNoticeRecord {
                 portal_id: notice.portal_id,
                 title: &notice.title,
+                body: &notice.body,
                 displayed_at: notice.displayed_at,
                 article_url: notice.article_url.as_deref(),
                 attachment_url: notice.attachment_url.as_deref(),
@@ -1132,6 +1134,25 @@ async fn run_portal_cycle(
                 let message_text = render_portal_notification(&notice);
                 let outcome = store.plan_portal_notice(&record, &message_text).await?;
                 accumulate_portal_plan(&mut report, &outcome);
+            }
+        }
+        for portal_id in store.portal_notice_body_backfill_ids(5).await? {
+            let notice = match fetch_portal_notice_or_skip(portal, portal_id, &mut report).await {
+                Ok(Some(notice)) => notice,
+                Ok(None) => {
+                    store.record_portal_notice_body_failure(portal_id).await?;
+                    continue;
+                }
+                Err(error) => {
+                    store.record_portal_notice_body_failure(portal_id).await?;
+                    return Err(error);
+                }
+            };
+            if store
+                .set_portal_notice_body(portal_id, &notice.body)
+                .await?
+            {
+                report.bodies_backfilled += 1;
             }
         }
         Ok(())
@@ -1176,6 +1197,7 @@ async fn archive_recent_portal_history_if_empty(
                 .archive_portal_notice(&PortalNoticeRecord {
                     portal_id: notice.portal_id,
                     title: &notice.title,
+                    body: &notice.body,
                     displayed_at: notice.displayed_at,
                     article_url: notice.article_url.as_deref(),
                     attachment_url: notice.attachment_url.as_deref(),
@@ -1669,7 +1691,7 @@ async fn process_interaction_updates(
             telegram
                 .upload_portal_document(
                     message.chat.id,
-                    &reply.user_text,
+                    &shorten_text(&reply.user_text, 1_024),
                     &file_name,
                     &content_type,
                     bytes,
@@ -2282,7 +2304,8 @@ async fn build_interaction_reply(
             let source_url = notice
                 .article_url
                 .clone()
-                .or_else(|| notice.attachment_url.clone());
+                .or_else(|| notice.attachment_url.clone())
+                .or_else(|| Some("https://portal.ut.edu.vn/".to_owned()));
             let mut reply = InteractionReply {
                 user_text: render_portal_notice_history_detail(&notice),
                 user_links: Vec::new(),
@@ -2306,10 +2329,9 @@ async fn build_interaction_reply(
                     .await
                 {
                     Ok(attachment) => reply.portal_document = Some(PortalDocumentReply { attachment }),
-                    Err(error) => reply.user_text.push_str(&format!(
-                        "\n\nTạm thời chưa tải được tệp đính kèm lúc này: {}",
-                        error.to_string().chars().take(300).collect::<String>()
-                    )),
+                    Err(error) => {
+                        reply.user_text = portal_attachment_error_message(&reply.user_text, &error.to_string());
+                    }
                 }
             }
             Ok(reply)
@@ -3095,19 +3117,28 @@ fn render_portal_notice_history_page(
     format!("Lịch sử thông báo Cổng đào tạo UTH - Trang {requested_page}\n\n{entries}{navigation}")
 }
 
+fn portal_attachment_error_message(text: &str, error: &str) -> String {
+    let suffix = format!(
+        "\n\nTạm thời chưa tải được tệp đính kèm lúc này: {}",
+        shorten_text(error, 300)
+    );
+    let available = 4_096_usize.saturating_sub(suffix.chars().count());
+    format!("{}{suffix}", shorten_text(text, available))
+}
+
 fn render_portal_notice_history_detail(notice: &PortalNoticeHistoryRecord) -> String {
     let source = notice
         .article_url
         .as_deref()
         .or(notice.attachment_url.as_deref())
         .map(|url| shorten_text(url, 280))
-        .unwrap_or_else(|| "không có".to_owned());
+        .unwrap_or_else(|| "https://portal.ut.edu.vn/".to_owned());
     let attachment = if notice.attachment_url.is_some() {
         "có, bot gửi kèm ngay sau khi tải"
     } else {
         "không có"
     };
-    format!(
+    let metadata = format!(
         "THÔNG BÁO PORTAL #{} (Cổng đào tạo UTH)\nTiêu đề: {}\nNgày đăng: {}\nThời gian crawl: {}\nTệp đính kèm: {}\nThông báo gốc: {}",
         notice.portal_id,
         shorten_text(notice.title.trim(), 500),
@@ -3115,7 +3146,12 @@ fn render_portal_notice_history_detail(notice: &PortalNoticeHistoryRecord) -> St
         format_vietnam_datetime(&notice.discovered_at.to_rfc3339()),
         attachment,
         source
-    )
+    );
+    if notice.body.trim().is_empty() {
+        return metadata;
+    }
+    let body_limit = 4_096_usize.saturating_sub(metadata.chars().count() + 2);
+    format!("{metadata}\n\n{}", shorten_text(&notice.body, body_limit))
 }
 
 fn render_latest_post_page(
@@ -5325,10 +5361,20 @@ mod tests {
     }
 
     #[test]
+    fn attachment_failure_preserves_a_bounded_history_reply() {
+        let body = "đ".repeat(4_096);
+        let message = super::portal_attachment_error_message(&body, "HTTP 503: tệp chưa sẵn sàng");
+        assert!(message.chars().count() <= 4_096);
+        assert!(message.contains("HTTP 503: tệp chưa sẵn sàng"));
+        assert!(message.starts_with('đ'));
+    }
+
+    #[test]
     fn renders_portal_history_with_attachment_and_navigation() {
         let notice = PortalNoticeHistoryRecord {
             portal_id: 1438,
             title: "Thông báo kiểm thử".to_owned(),
+            body: "Sinh viên theo dõi thời gian đăng ký học phần.".to_owned(),
             displayed_at: Utc::now(),
             article_url: Some("https://portal.ut.edu.vn/example".to_owned()),
             attachment_url: Some(
@@ -5345,6 +5391,7 @@ mod tests {
         assert!(page.contains("/portal_history_2"));
         assert!(detail.contains("THÔNG BÁO PORTAL #1438"));
         assert!(detail.contains("bot gửi kèm"));
+        assert!(detail.contains("Sinh viên theo dõi thời gian đăng ký học phần."));
         assert!(detail.chars().count() <= 1_024);
     }
 

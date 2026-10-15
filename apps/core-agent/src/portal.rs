@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Utc};
+use html5gum::{State, Token, Tokenizer};
 use regex::Regex;
 use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, CONTENT_DISPOSITION, CONTENT_TYPE, REFERER, RETRY_AFTER,
@@ -27,6 +28,7 @@ pub const TELEGRAM_DOCUMENT_LIMIT: usize = 50 * 1024 * 1024;
 pub struct PortalNotice {
     pub portal_id: i64,
     pub title: String,
+    pub body: String,
     pub displayed_at: DateTime<Utc>,
     pub article_url: Option<String>,
     pub attachment_url: Option<String>,
@@ -249,6 +251,7 @@ impl PortalClient {
         Ok(PortalNotice {
             portal_id,
             title,
+            body: portal_body_text(&envelope.body.noi_dung),
             displayed_at: envelope.body.ngay_hien_thi,
             article_url,
             attachment_url,
@@ -530,8 +533,101 @@ pub fn render_portal_notification(notice: &PortalNotice) -> String {
     let header = "Thông báo từ Cổng đào tạo UTH (Portal)";
     let footer = format!("\n\nNgày đăng: {displayed_at}");
     let reserved = header.chars().count() + footer.chars().count() + 2;
-    let title = truncate_chars(&notice.title, 1_024_usize.saturating_sub(reserved));
-    format!("{header}\n\n{title}{footer}")
+    let title_limit = if notice.attachment_url.is_some() && !notice.body.trim().is_empty() {
+        256
+    } else {
+        1_024_usize.saturating_sub(reserved)
+    };
+    let title = truncate_chars(&notice.title, title_limit);
+    let limit: usize = if notice.attachment_url.is_some() {
+        1_024
+    } else {
+        4_096
+    };
+    let prefix = format!("{header}\n\n{title}{footer}");
+    if notice.body.trim().is_empty() {
+        return prefix;
+    }
+    let body_limit = limit.saturating_sub(prefix.chars().count() + 2);
+    if body_limit == 0 {
+        return prefix;
+    }
+    format!("{prefix}\n\n{}", truncate_chars(&notice.body, body_limit))
+}
+
+fn portal_body_text(html: &str) -> String {
+    let mut tokenizer = Tokenizer::new(html);
+    let mut text = String::new();
+    let mut hidden_depth = 0_usize;
+    while let Some(Ok(token)) = tokenizer.next() {
+        match token {
+            Token::StartTag(tag) => {
+                let name = tag.name.as_ref();
+                if matches!(
+                    name,
+                    b"script" | b"style" | b"template" | b"head" | b"iframe"
+                ) {
+                    hidden_depth += 1;
+                    if name == b"script" {
+                        tokenizer.set_state(State::ScriptData);
+                    } else if matches!(name, b"style" | b"iframe") {
+                        tokenizer.set_state(State::RawText);
+                    }
+                } else if hidden_depth == 0 {
+                    if is_portal_block_tag(name) || name == b"br" {
+                        text.push('\n');
+                    }
+                    if name == b"li" {
+                        text.push_str("- ");
+                    }
+                }
+            }
+            Token::EndTag(tag) => {
+                let name = tag.name.as_ref();
+                if matches!(
+                    name,
+                    b"script" | b"style" | b"template" | b"head" | b"iframe"
+                ) {
+                    hidden_depth = hidden_depth.saturating_sub(1);
+                } else if hidden_depth == 0 && is_portal_block_tag(name) {
+                    text.push('\n');
+                }
+            }
+            Token::String(value) if hidden_depth == 0 => {
+                text.push_str(&String::from_utf8_lossy(&value));
+            }
+            _ => {}
+        }
+    }
+    let normalized = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    truncate_chars(&normalized, 16_384)
+}
+
+fn is_portal_block_tag(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"p" | b"div"
+            | b"li"
+            | b"ul"
+            | b"ol"
+            | b"h1"
+            | b"h2"
+            | b"h3"
+            | b"h4"
+            | b"h5"
+            | b"h6"
+            | b"tr"
+            | b"td"
+            | b"th"
+            | b"blockquote"
+            | b"pre"
+            | b"section"
+    )
 }
 
 fn portal_notice_title(portal_id: i64, raw: &str) -> String {
@@ -740,6 +836,31 @@ mod tests {
         extract_first_daotao_pdf_link, extract_first_https_link, is_attachment_unavailable,
         render_portal_notification, validate_attachment_url,
     };
+
+    #[tokio::test]
+    async fn retains_inline_notice_content_in_the_notification() {
+        let (base_url, server) = mock_server(vec![(
+            200,
+            r#"{"success":true,"body":{"id":325,"tieuDe":"Đăng ký học phần điều kiện","noiDung":"<p>Sinh viên đăng ký <strong>xuyên suốt</strong> năm học.</p><p>Điều chỉnh trước <b>02 tuần</b> &amp; đóng học phí trước 1/3 thời lượng.</p><ul><li>Khóa &#50;&#48;&#50;&#54; theo kế hoạch.</li></ul><script>secret_script()</script><style>.hidden { display:none }</style>","ngayHienThi":"2026-10-15T03:00:00Z","noiDungUrl":"","noiDungFileType":""}}"#,
+        )])
+        .await;
+        let client = PortalClient::new(
+            Url::parse(&base_url).unwrap(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+        let notice = client.fetch_notice(325).await.unwrap();
+        let message = render_portal_notification(&notice);
+        assert!(message.contains("Sinh viên đăng ký xuyên suốt năm học."));
+        assert!(message.contains("02 tuần & đóng học phí trước 1/3 thời lượng."));
+        assert!(message.contains("Khóa 2026 theo kế hoạch."));
+        assert!(!message.contains("<p>"));
+        assert!(!message.contains("secret_script"));
+        assert!(!message.contains("display:none"));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn retries_a_failed_portal_list_request_within_the_bound() {
@@ -1055,10 +1176,58 @@ mod tests {
     }
 
     #[test]
+    fn preserves_paragraphs_and_text_after_hidden_html() {
+        let html = "<p>Đầu &amp; giữa</p><ul><li>Mục 1</li></ul><script>if (a < b) run()</script><style>p { color: red }</style><template><p>Ẩn</p></template><p>Cuối</p>";
+        assert_eq!(
+            super::portal_body_text(html),
+            "Đầu & giữa\n\n- Mục 1\n\nCuối"
+        );
+    }
+
+    #[test]
+    fn keeps_a_long_title_and_body_within_the_document_caption_limit() {
+        let notice = PortalNotice {
+            portal_id: 1,
+            title: "A".repeat(2_000),
+            body: "Nội dung cần đọc".repeat(100),
+            displayed_at: chrono::Utc.with_ymd_and_hms(2026, 10, 15, 1, 2, 3).unwrap(),
+            article_url: None,
+            attachment_url: Some(
+                "https://portal.ut.edu.vn/api/v1/notification/getFile/2".to_owned(),
+            ),
+            attachment_content_type: Some("application/pdf".to_owned()),
+        };
+        let message = render_portal_notification(&notice);
+        assert!(message.chars().count() <= 1_024);
+        assert!(message.contains("Nội dung cần đọc"));
+    }
+
+    #[test]
+    fn text_notices_keep_more_than_a_document_caption_of_body() {
+        let mut notice = PortalNotice {
+            portal_id: 1,
+            title: "Học phần điều kiện".to_owned(),
+            body: "đăng ký học phần ".repeat(500),
+            displayed_at: chrono::Utc.with_ymd_and_hms(2026, 10, 15, 1, 2, 3).unwrap(),
+            article_url: None,
+            attachment_url: None,
+            attachment_content_type: None,
+        };
+        let message = render_portal_notification(&notice);
+        assert!(message.chars().count() > 1_024);
+        assert!(message.chars().count() <= 4_096);
+        assert!(message.ends_with('…'));
+        notice.attachment_url =
+            Some("https://portal.ut.edu.vn/api/v1/notification/getFile/2".to_owned());
+        assert!(render_portal_notification(&notice).chars().count() <= 1_024);
+    }
+
+    #[test]
     fn renders_a_bounded_plain_text_portal_caption() {
         let notice = PortalNotice {
             portal_id: 1,
             title: "A".repeat(2_000),
+            body: String::new(),
             displayed_at: chrono::Utc.with_ymd_and_hms(2026, 7, 27, 1, 2, 3).unwrap(),
             article_url: None,
             attachment_url: None,

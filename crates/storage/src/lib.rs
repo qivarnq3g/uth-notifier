@@ -414,6 +414,7 @@ pub struct ClaimedDelivery {
 pub struct PortalNoticeRecord<'a> {
     pub portal_id: i64,
     pub title: &'a str,
+    pub body: &'a str,
     pub displayed_at: DateTime<Utc>,
     pub article_url: Option<&'a str>,
     pub attachment_url: Option<&'a str>,
@@ -425,6 +426,7 @@ pub struct PortalNoticeRecord<'a> {
 pub struct PortalNoticeHistoryRecord {
     pub portal_id: i64,
     pub title: String,
+    pub body: String,
     pub displayed_at: DateTime<Utc>,
     pub article_url: Option<String>,
     pub attachment_url: Option<String>,
@@ -3818,8 +3820,8 @@ impl CrawlStore {
         let notice_created = sqlx::query(
             "INSERT INTO portal_notices \
              (portal_id, title, displayed_at, article_url, attachment_url, \
-              attachment_file_name, attachment_content_type) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+              attachment_file_name, attachment_content_type, body, body_fetched_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP) \
              ON CONFLICT (portal_id) DO NOTHING",
         )
         .bind(notice.portal_id)
@@ -3829,6 +3831,7 @@ impl CrawlStore {
         .bind(notice.attachment_url)
         .bind(notice.attachment_file_name)
         .bind(notice.attachment_content_type)
+        .bind(notice.body)
         .execute(&mut *transaction)
         .await?
         .rows_affected()
@@ -3849,7 +3852,12 @@ impl CrawlStore {
         )
         .bind(notice.portal_id)
         .bind(message_text)
-        .bind(notice.article_url.or(notice.attachment_url))
+        .bind(
+            notice
+                .article_url
+                .or(notice.attachment_url)
+                .or(Some("https://portal.ut.edu.vn/")),
+        )
         .bind(notice.attachment_url)
         .bind(notice.attachment_file_name)
         .bind(notice.attachment_content_type)
@@ -3892,8 +3900,8 @@ impl CrawlStore {
         let inserted = sqlx::query(
             "INSERT INTO portal_notices \
              (portal_id, title, displayed_at, article_url, attachment_url, \
-              attachment_file_name, attachment_content_type) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+              attachment_file_name, attachment_content_type, body, body_fetched_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP) \
              ON CONFLICT (portal_id) DO NOTHING",
         )
         .bind(notice.portal_id)
@@ -3903,6 +3911,7 @@ impl CrawlStore {
         .bind(notice.attachment_url)
         .bind(notice.attachment_file_name)
         .bind(notice.attachment_content_type)
+        .bind(notice.body)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -3918,6 +3927,49 @@ impl CrawlStore {
         Ok(inserted == 1)
     }
 
+    pub async fn portal_notice_body_backfill_ids(&self, limit: i64) -> Result<Vec<i64>> {
+        if !(1..=5).contains(&limit) {
+            bail!("Portal body backfill limit must be between 1 and 5");
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT portal_id FROM portal_notices WHERE body_fetched_at IS NULL AND body_fetch_attempts < 3 \
+             ORDER BY displayed_at DESC, portal_id DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn record_portal_notice_body_failure(&self, portal_id: i64) -> Result<()> {
+        if portal_id <= 0 {
+            bail!("Portal notice ID must be positive");
+        }
+        sqlx::query(
+            "UPDATE portal_notices SET body_fetch_attempts = LEAST(body_fetch_attempts + 1, 3) \
+             WHERE portal_id = $1 AND body_fetched_at IS NULL",
+        )
+        .bind(portal_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_portal_notice_body(&self, portal_id: i64, body: &str) -> Result<bool> {
+        if portal_id <= 0 || body.len() > 65_536 {
+            bail!("Portal notice body is invalid");
+        }
+        Ok(sqlx::query(
+            "UPDATE portal_notices SET body = $2, body_fetched_at = CURRENT_TIMESTAMP \
+             WHERE portal_id = $1 AND body_fetched_at IS NULL",
+        )
+        .bind(portal_id)
+        .bind(body)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
     pub async fn portal_notice_history(
         &self,
         limit: i64,
@@ -3929,7 +3981,7 @@ impl CrawlStore {
             );
         }
         let rows = sqlx::query(
-            "SELECT portal_id, title, displayed_at, article_url, attachment_url, \
+            "SELECT portal_id, title, body, displayed_at, article_url, attachment_url, \
                     attachment_content_type, discovered_at \
              FROM portal_notices ORDER BY portal_id DESC LIMIT $1 OFFSET $2",
         )
@@ -3942,6 +3994,7 @@ impl CrawlStore {
             .map(|row| PortalNoticeHistoryRecord {
                 portal_id: row.get("portal_id"),
                 title: row.get("title"),
+                body: row.get("body"),
                 displayed_at: row.get("displayed_at"),
                 article_url: row.get("article_url"),
                 attachment_url: row.get("attachment_url"),
@@ -3959,7 +4012,7 @@ impl CrawlStore {
             bail!("Portal notice ID must be positive");
         }
         let row = sqlx::query(
-            "SELECT portal_id, title, displayed_at, article_url, attachment_url, \
+            "SELECT portal_id, title, body, displayed_at, article_url, attachment_url, \
                     attachment_content_type, discovered_at \
              FROM portal_notices WHERE portal_id = $1",
         )
@@ -3969,6 +4022,7 @@ impl CrawlStore {
         Ok(row.map(|row| PortalNoticeHistoryRecord {
             portal_id: row.get("portal_id"),
             title: row.get("title"),
+            body: row.get("body"),
             displayed_at: row.get("displayed_at"),
             article_url: row.get("article_url"),
             attachment_url: row.get("attachment_url"),
@@ -3989,6 +4043,7 @@ impl CrawlStore {
         let record = PortalNoticeRecord {
             portal_id,
             title: "attachment",
+            body: "",
             displayed_at: Utc::now(),
             article_url: None,
             attachment_url: Some(attachment_url),
@@ -5328,7 +5383,12 @@ fn validate_notification_event(
 
 fn validate_portal_notice(notice: &PortalNoticeRecord<'_>, message_text: &str) -> Result<()> {
     validate_portal_notice_record(notice)?;
-    if !(1..=1_024).contains(&message_text.chars().count()) {
+    let limit = if notice.attachment_url.is_some() {
+        1_024
+    } else {
+        TELEGRAM_MESSAGE_LIMIT
+    };
+    if !(1..=limit).contains(&message_text.chars().count()) {
         bail!("Portal notice message is invalid");
     }
     Ok(())
@@ -5336,7 +5396,7 @@ fn validate_portal_notice(notice: &PortalNoticeRecord<'_>, message_text: &str) -
 
 fn validate_portal_notice_record(notice: &PortalNoticeRecord<'_>) -> Result<()> {
     let title_length = notice.title.trim().chars().count();
-    if notice.portal_id <= 0 || !(1..=1_000).contains(&title_length) {
+    if notice.portal_id <= 0 || !(1..=1_000).contains(&title_length) || notice.body.len() > 65_536 {
         bail!("Portal notice values are invalid");
     }
     for raw_url in [notice.article_url, notice.attachment_url]

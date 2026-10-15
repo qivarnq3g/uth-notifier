@@ -1304,6 +1304,7 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
             &PortalNoticeRecord {
                 portal_id: 101,
                 title: "Thông báo kiểm thử",
+                body: "Nội dung học phần: điều chỉnh trước 02 tuần.",
                 displayed_at,
                 article_url: Some("https://daotao.ut.edu.vn/thong-bao/101"),
                 attachment_url: Some("https://portal.ut.edu.vn/api/v1/notification/getFile/101"),
@@ -1320,6 +1321,61 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
     assert_eq!(store.portal_notice_cursor().await.unwrap(), Some(101));
 
     assert!(store.portal_notice_exists(101).await.unwrap());
+    let saved = store
+        .portal_notice_history_item(101)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.body, "Nội dung học phần: điều chỉnh trước 02 tuần.");
+    assert_eq!(
+        store.portal_notice_history(1, 0).await.unwrap()[0].body,
+        saved.body
+    );
+    assert!(
+        store
+            .portal_notice_body_backfill_ids(5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sqlx::query(
+        "UPDATE portal_notices SET body = '', body_fetched_at = NULL WHERE portal_id = 101",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store.portal_notice_body_backfill_ids(5).await.unwrap(),
+        vec![101]
+    );
+    assert!(
+        store
+            .set_portal_notice_body(101, &saved.body)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .set_portal_notice_body(101, "Không ghi đè")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .portal_notice_body_backfill_ids(5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .portal_notice_history_item(101)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        saved.body
+    );
     assert!(!store.portal_notice_exists(99).await.unwrap());
     assert_eq!(
         store
@@ -1334,6 +1390,7 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
             &PortalNoticeRecord {
                 portal_id: 101,
                 title: "Thông báo trùng lặp",
+                body: "Không thay đổi nội dung đã lưu",
                 displayed_at,
                 article_url: None,
                 attachment_url: None,
@@ -1353,13 +1410,14 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
             &PortalNoticeRecord {
                 portal_id: 99,
                 title: "Thông báo ID nhỏ hơn cursor",
+                body: "Nội dung văn bản không có tệp đính kèm",
                 displayed_at,
                 article_url: None,
                 attachment_url: None,
                 attachment_file_name: None,
                 attachment_content_type: None,
             },
-            "Thông báo bắt buộc từ Portal UTH",
+            &"Thông báo dài không có tệp. ".repeat(90),
         )
         .await
         .unwrap();
@@ -1412,6 +1470,25 @@ async fn portal_notices_reach_stopped_users_and_reuse_uploaded_documents() {
     .await
     .unwrap();
     assert!(stopped_exists);
+
+    for portal_id in 200..206_i64 {
+        sqlx::query("INSERT INTO portal_notices (portal_id, title, displayed_at) VALUES ($1, 'legacy', CURRENT_TIMESTAMP)")
+            .bind(portal_id).execute(&pool).await.unwrap();
+    }
+    let blocked = store.portal_notice_body_backfill_ids(5).await.unwrap();
+    assert_eq!(blocked, vec![205, 204, 203, 202, 201]);
+    for portal_id in blocked {
+        for _ in 0..3 {
+            store
+                .record_portal_notice_body_failure(portal_id)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        store.portal_notice_body_backfill_ids(5).await.unwrap(),
+        vec![200]
+    );
 }
 
 #[tokio::test]
@@ -1440,6 +1517,7 @@ async fn unavailable_portal_attachment_falls_back_to_parallel_text_delivery() {
             &PortalNoticeRecord {
                 portal_id: 300,
                 title: "Thông báo có tệp không tải được",
+                body: "Nội dung vẫn được lưu khi tệp bị lỗi.",
                 displayed_at: Utc::now(),
                 article_url: Some("https://daotao.ut.edu.vn/thong-bao/300"),
                 attachment_url: Some("https://portal.ut.edu.vn/api/v1/notification/getFile/300"),

@@ -1,0 +1,20 @@
+[Unit]
+Description=Detect and evict corrupted page cache of UTH Notifier runtime executables
+ConditionPathIsDirectory=/opt/uth-notifier/current/apps/browser-agent/node_modules/playwright-core/.local-browsers
+
+[Service]
+Type=oneshot
+User=uth-notifier
+Group=uth-notifier
+StateDirectory=uth-notifier-page-cache-guard
+Environment=PAGE_CACHE_GUARD_STATE_DIRECTORY=/var/lib/uth-notifier-page-cache-guard
+ExecStart=/bin/bash /opt/uth-notifier/current/deploy/page-cache-guard.sh /opt/uth-notifier/current/apps/browser-agent/node_modules/playwright-core/.local-browsers /usr/bin/node /opt/uth-notifier/current/bin/uth-agent
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryHigh=96M
+MemoryMax=160M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

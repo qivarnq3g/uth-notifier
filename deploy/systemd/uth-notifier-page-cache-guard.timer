@@ -1,0 +1,11 @@
+[Unit]
+Description=Check UTH Notifier runtime executables for page-cache corruption every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=uth-notifier-page-cache-guard.service
+
+[Install]
+WantedBy=timers.target

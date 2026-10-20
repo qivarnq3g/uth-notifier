@@ -312,6 +312,7 @@ Bố cục trên máy chủ mà các unit trong [`deploy/systemd`](deploy/system
 | `uth-notifier-edge-reconciler.service` | `reconcile-edge` (chỉ khi dùng edge). |
 | `uth-notifier-backup.timer` / `.service` | `pg_dump` hằng ngày, giữ 14 ngày và tối thiểu 7 bản. |
 | `uth-notifier-browser-crash-clean.timer` / `.service` | Dọn báo cáo crash của Chromium. |
+| `uth-notifier-page-cache-guard.timer` / `.service` | Mỗi 5 phút so hash Chromium, Node, `uth-agent` đọc qua page cache với hash ghim từ đĩa; lệch thì tự xóa cache của file đó. |
 
 Các tệp cấu hình đi kèm: [`deploy/tmpfiles.d`](deploy/tmpfiles.d) (vào `/etc/tmpfiles.d/`), [`deploy/journald.conf.d`](deploy/journald.conf.d) (giới hạn dung lượng log) và [`deploy/postgresql-low-memory.conf`](deploy/postgresql-low-memory.conf) (tinh chỉnh PostgreSQL cho máy ít RAM).
 

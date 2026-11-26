@@ -293,6 +293,20 @@ pub struct ActiveEventRecord {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecentCampaignCandidate {
+    pub campaign_id: i64,
+    pub post_id: i64,
+    pub source_id: i64,
+    pub source_name: String,
+    pub post_url: Option<String>,
+    pub action_url: Option<String>,
+    pub outbound_links: Vec<String>,
+    pub published_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemReportStats {
     pub total_subscribers: i64,
@@ -2945,6 +2959,60 @@ impl CrawlStore {
             .collect())
     }
 
+    pub async fn recent_facebook_campaigns(
+        &self,
+        exclude_post_id: i64,
+        window_days: i64,
+        limit: i64,
+    ) -> Result<Vec<RecentCampaignCandidate>> {
+        if window_days <= 0 {
+            bail!("recent campaign window must be positive");
+        }
+        let limit = limit.clamp(1, 300);
+        let rows = sqlx::query(
+            "SELECT campaign.id AS campaign_id, \
+                    post.id AS post_id, \
+                    post.source_id, \
+                    source.name AS source_name, \
+                    campaign.post_url, \
+                    campaign.action_url, \
+                    post.outbound_links, \
+                    post.published_at, \
+                    campaign.created_at, \
+                    post.text \
+             FROM campaigns AS campaign \
+             JOIN posts AS post ON post.id = campaign.post_id \
+             JOIN sources AS source ON source.id = post.source_id \
+             WHERE campaign.portal_notice_id IS NULL \
+               AND campaign.post_id IS NOT NULL \
+               AND campaign.post_id <> $1 \
+               AND campaign.created_at >= CURRENT_TIMESTAMP - ($2::bigint * INTERVAL '1 day') \
+             ORDER BY campaign.created_at DESC, campaign.id DESC \
+             LIMIT $3",
+        )
+        .bind(exclude_post_id)
+        .bind(window_days)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RecentCampaignCandidate {
+                    campaign_id: row.get("campaign_id"),
+                    post_id: row.get("post_id"),
+                    source_id: row.get("source_id"),
+                    source_name: row.get("source_name"),
+                    post_url: row.get("post_url"),
+                    action_url: row.get("action_url"),
+                    outbound_links: serde_json::from_value(row.get("outbound_links"))?,
+                    published_at: row.get("published_at"),
+                    created_at: row.get("created_at"),
+                    text: row.get("text"),
+                })
+            })
+            .collect()
+    }
+
     pub async fn system_report_stats(&self) -> Result<SystemReportStats> {
         let sub_row = sqlx::query(
             "SELECT \
@@ -3488,8 +3556,8 @@ impl CrawlStore {
         action: ManualReviewAction,
         reason: Option<&str>,
     ) -> Result<()> {
-        if classification_id <= 0 || admin_chat_id == 0 {
-            bail!("classification review IDs must be valid");
+        if classification_id <= 0 {
+            bail!("classification review ID must be positive");
         }
         let action_name = match action {
             ManualReviewAction::Send => "send",
@@ -4054,7 +4122,7 @@ impl CrawlStore {
         let mut transaction = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE portal_notices SET attachment_url = $2, attachment_content_type = $3 \
-             WHERE portal_id = $1 AND attachment_url IS NULL",
+             WHERE portal_id = $1 AND (attachment_url IS NULL OR attachment_url <> $2)",
         )
         .bind(portal_id)
         .bind(attachment_url)
@@ -4066,7 +4134,7 @@ impl CrawlStore {
         if updated {
             sqlx::query(
                 "UPDATE campaigns SET attachment_url = $2, attachment_content_type = $3 \
-                 WHERE portal_notice_id = $1 AND attachment_url IS NULL AND telegram_file_id IS NULL",
+                 WHERE portal_notice_id = $1 AND (attachment_url IS NULL OR attachment_url <> $2) AND telegram_file_id IS NULL",
             )
             .bind(portal_id)
             .bind(attachment_url)

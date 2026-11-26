@@ -334,7 +334,7 @@ fn infer_yearless_date(month: &str, day: &str, today: NaiveDate) -> Option<Naive
     }
 }
 
-fn normalize_vietnamese(value: &str) -> String {
+pub fn normalize_vietnamese(value: &str) -> String {
     value
         .chars()
         .map(|character| match character {

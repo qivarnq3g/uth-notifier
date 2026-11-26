@@ -38,6 +38,14 @@ exec "$real_dd" "\$@"
 EOF
 chmod +x "$work/shim/dd"
 
+cat > "$work/shim/ldd" <<EOF
+#!/bin/bash
+if [ "\${1:-}" = "$work/files/node" ]; then
+  printf '\tlibnode.so.115 => %s/files/libnode.so.115 (0x00007f0000000000)\n' "$work"
+fi
+EOF
+chmod +x "$work/shim/ldd"
+
 failures=0
 check() {
   if [ "$2" = "$3" ]; then
@@ -62,19 +70,32 @@ field() {
 
 printf 'chrome-good' > "$work/files/browser/chrome"
 printf 'node-good' > "$work/files/node"
+printf 'libnode-good' > "$work/files/libnode.so.115"
+chmod +x "$work/files/node"
 printf 'chrome-good' > "$work/disk/chrome"
 printf 'node-good' > "$work/disk/node"
+printf 'libnode-good' > "$work/disk/libnode.so.115"
 
 run_guard
 check "first run exits zero" 0 "$status"
-check "first run checks every file" 2 "$(field checked)"
-check "first run pins every file" 2 "$(field pinned)"
+check "first run checks every file including ldd dependencies" 3 "$(field checked)"
+check "first run pins every file including ldd dependencies" 3 "$(field pinned)"
 check "first run evicts nothing" 0 "$(field evicted)"
 
 run_guard
 check "second run reuses pinned digests" 0 "$(field pinned)"
-check "second run still checks every file" 2 "$(field checked)"
+check "second run still checks every file including ldd dependencies" 3 "$(field checked)"
 check "second run evicts nothing" 0 "$(field evicted)"
+
+lib_mtime=$(stat -c %Y "$work/files/libnode.so.115")
+printf 'libnode-flip' > "$work/files/libnode.so.115"
+touch -d "@$lib_mtime" "$work/files/libnode.so.115"
+SHIM_HEAL=1 run_guard
+check "healed shared library corruption exits zero" 0 "$status"
+check "healed shared library corruption is evicted" 1 "$(field evicted)"
+check "eviction targets the corrupted shared library" "$work/files/libnode.so.115" "$(cat "$work/evictions")"
+check "shared library content is restored" libnode-good "$(cat "$work/files/libnode.so.115")"
+rm -f "$work/evictions"
 
 mtime=$(stat -c %Y "$work/files/browser/chrome")
 printf 'chrome-flip' > "$work/files/browser/chrome"
@@ -105,7 +126,7 @@ run_guard
 check "replaced file exits zero" 0 "$status"
 check "replaced file is pinned again" 1 "$(field pinned)"
 check "replaced file is not evicted" 0 "$(field evicted)"
-check "state keeps only current files" 2 "$(wc -l < "$work/state/digests" | tr -d ' ')"
+check "state keeps only current files" 3 "$(wc -l < "$work/state/digests" | tr -d ' ')"
 
 set +e
 PAGE_CACHE_GUARD_STATE_DIRECTORY="$work/state" bash "$guard" "$work/missing" > /dev/null 2>&1

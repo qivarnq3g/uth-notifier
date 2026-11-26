@@ -17,11 +17,21 @@ pub enum GeminiReviewDecision {
     Skip,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateCampaignContext {
+    pub campaign_id: i64,
+    pub source_name: String,
+    pub sent_at: DateTime<Utc>,
+    pub shared_links: Vec<String>,
+    pub text_excerpt: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiReviewOutput {
     pub decision: GeminiReviewDecision,
     pub reason: String,
     pub confidence: f64,
+    pub duplicate_of_campaign_id: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -75,6 +85,7 @@ struct RawReviewDecision {
     decision: String,
     reason: String,
     confidence: Option<f64>,
+    duplicate_of_campaign_id: Option<i64>,
 }
 
 impl GeminiReviewerClient {
@@ -118,6 +129,29 @@ impl GeminiReviewerClient {
         current_time: Option<DateTime<FixedOffset>>,
         learning_examples: &[AiLearningExample],
     ) -> Result<GeminiReviewOutput> {
+        self.review_post_with_duplicates(
+            source_name,
+            post_text,
+            post_url,
+            published_at,
+            current_time,
+            learning_examples,
+            &[],
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn review_post_with_duplicates(
+        &self,
+        source_name: &str,
+        post_text: &str,
+        post_url: &str,
+        published_at: &str,
+        current_time: Option<DateTime<FixedOffset>>,
+        learning_examples: &[AiLearningExample],
+        duplicate_candidates: &[DuplicateCampaignContext],
+    ) -> Result<GeminiReviewOutput> {
         let base = self.api_base.as_str().trim_end_matches('/');
         let endpoint = format!("{base}/v1beta/models/{}:generateContent", self.model);
         let now = current_time.unwrap_or_else(|| {
@@ -125,13 +159,14 @@ impl GeminiReviewerClient {
                 .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
             Utc::now().with_timezone(&offset)
         });
-        let prompt = build_user_prompt(
+        let prompt = build_user_prompt_with_duplicates(
             source_name,
             post_text,
             post_url,
             published_at,
             now,
             learning_examples,
+            duplicate_candidates,
         );
         let request_payload = GeminiGenerateRequest {
             system_instruction: GeminiContent {
@@ -160,6 +195,9 @@ impl GeminiReviewerClient {
                         },
                         "confidence": {
                             "type": "NUMBER"
+                        },
+                        "duplicate_of_campaign_id": {
+                            "type": "INTEGER"
                         }
                     },
                     "required": ["decision", "reason"]
@@ -176,7 +214,16 @@ impl GeminiReviewerClient {
                 .review_post_with_api_key(&endpoint, api_key, &request_payload)
                 .await
             {
-                Ok(output) => return Ok(output),
+                Ok(mut output) => {
+                    if let Some(campaign_id) = output.duplicate_of_campaign_id
+                        && !duplicate_candidates
+                            .iter()
+                            .any(|candidate| candidate.campaign_id == campaign_id)
+                    {
+                        output.duplicate_of_campaign_id = None;
+                    }
+                    return Ok(output);
+                }
                 Err(error) => {
                     attempt_errors.push(format!("API key attempt {} failed: {error:#}", index + 1))
                 }
@@ -238,6 +285,7 @@ impl GeminiReviewerClient {
             decision,
             reason: raw_decision.reason,
             confidence: raw_decision.confidence.unwrap_or(0.9).clamp(0.0, 1.0),
+            duplicate_of_campaign_id: raw_decision.duplicate_of_campaign_id,
         })
     }
 }
@@ -255,21 +303,31 @@ fn system_instruction() -> &'static str {
        2. Mốc thời gian diễn ra sự kiện, hoạt động hoặc hạn chót đăng ký/nộp hồ sơ trong bài viết ĐÃ QUA trong quá khứ so với thời điểm hiện tại.\n\
        3. Bài viết là bài tổng kết, nhìn lại (recap), cảm ơn sau sự kiện mà không có thông báo hay quyền lợi mới nào tiếp diễn cho sinh viên.\n\
      - Chỉ xem xét duyệt (decision = 'send') khi bài viết vừa đăng gần đây (trong vòng 1-2 ngày) VÀ các hoạt động, sự kiện, hạn chót vẫn còn ở tương lai so với thời điểm hiện tại.\n\n\
+     QUY ĐỊNH BẮT BUỘC VỀ ĐỐI TƯỢNG THAM GIA:\n\
+     - Đọc toàn bộ điều kiện và đối tượng tham gia trong nội dung. Đơn vị tổ chức và đối tượng được tham gia là hai thông tin khác nhau; không suy luận giới hạn đối tượng chỉ từ tên trang, khoa hay trường tổ chức.\n\
+     - Sinh viên UTH thuộc nhóm sinh viên các trường trên địa bàn TP.HCM. Bài mở cho 'sinh viên các trường trên địa bàn TP.HCM', 'sinh viên các trường đại học, cao đẳng tại Thành phố Hồ Chí Minh' hoặc 'sinh viên toàn quốc' bao gồm sinh viên UTH, dù không ghi riêng tên UTH.\n\
+     - Nếu bài ghi sinh viên trường tổ chức VÀ sinh viên các trường khác, phải xét cả hai nhóm. Không coi đây là hoạt động chỉ dành cho sinh viên trường tổ chức.\n\
+     - Hoạt động học thuật, cuộc thi hoặc minigame kiến thức có cách tham gia cụ thể và mở cho nhóm sinh viên bao gồm UTH là phù hợp để duyệt khi còn thời hạn, kể cả do trường khác tổ chức. Minh chứng tham gia là một quyền lợi hợp lệ; không yêu cầu bài phải cam kết điểm rèn luyện riêng cho UTH. Không suy diễn giấy chứng nhận hoặc điểm của trường tổ chức thành điểm rèn luyện được UTH công nhận.\n\
+     - Địa điểm tổ chức ở TP.HCM tự nó không chứng minh sinh viên UTH được tham gia. Bỏ qua bài CHỈ dành cho sinh viên một trường khác, khoa, lớp, khóa hoặc thành viên nội bộ mà sinh viên UTH không đáp ứng điều kiện. Các giới hạn thời gian và chống quảng cáo vẫn phải được tuân thủ.\n\n\
      Tiêu chuẩn ĐƯỢC DUYỆT (decision = 'send'):\n\
      1. Hoạt động, sự kiện có cấp Điểm Rèn Luyện (ĐRL) hoặc Công tác xã hội (CTXH) cho sinh viên.\n\
      2. Thông báo học bổng, trợ cấp học tập, miễn giảm học phí cho sinh viên.\n\
-     3. Cuộc thi học thuật, nghiên cứu khoa học, đổi mới sáng tạo do trường/khoa/đoàn hội tổ chức hoặc đồng tổ chức.\n\
+     3. Cuộc thi học thuật, minigame kiến thức, nghiên cứu khoa học, đổi mới sáng tạo do trường/khoa/đoàn hội tổ chức hoặc đồng tổ chức, bao gồm đơn vị ngoài UTH khi đối tượng tham gia mở cho sinh viên UTH.\n\
      4. Cơ hội thực tập, việc làm, ngày hội tuyển dụng chính thức từ các doanh nghiệp uy tín dành cho sinh viên UTH.\n\
      5. Hoạt động tình nguyện, chiến dịch tình nguyện Mùa hè xanh, Xuân tình nguyện, hiến máu nhân đạo.\n\
      6. Thông báo đào tạo, khảo sát, quy chế học vụ quan trọng của trường.\n\n\
      Tiêu chuẩn BỎ QUA (decision = 'skip'):\n\
      1. Bài đăng quá cũ (từ 3 ngày trước trở lên) hoặc sự kiện/hạn chót đã trôi qua.\n\
-     2. Bài viết của trường khác hoặc tổ chức ngoài trường không mang lại quyền lợi chung cho sinh viên UTH.\n\
+     2. Bài viết của trường khác hoặc tổ chức ngoài trường có điều kiện tham gia loại trừ sinh viên UTH hoặc không có hoạt động, cơ hội hay quyền lợi sinh viên phù hợp. Không bỏ qua chỉ vì đơn vị tổ chức không phải UTH.\n\
      3. Quảng cáo dịch vụ, khóa học thương mại ngoài trường không có xác nhận của UTH hoặc không rõ nguồn gốc.\n\
      4. Tuyển dụng đa cấp, làm việc online không rõ ràng, spam tuyển dụng.\n\
      5. Tâm sự, meme, bài viết cá nhân, tìm đồ thất lạc, bài hát/văn nghệ, bài nhìn lại khoảnh khắc/recap sự kiện đã qua.\n\
      6. Thông báo nội bộ họp câu lạc bộ/đội nhóm chỉ dành cho thành viên kín của CLB đó, không mở cho sinh viên toàn trường và không có ĐRL.\n\
-     7. Bài đăng chỉ có hình ảnh không có nội dung văn bản cụ thể hoặc bài chia sẻ lại không có thông tin hữu ích."
+     7. Bài đăng chỉ có hình ảnh không có nội dung văn bản cụ thể hoặc bài chia sẻ lại không có thông tin hữu ích.\n\n\
+     QUY ĐỊNH BẮT BUỘC VỀ CHỐNG TRÙNG BÀI GIỮA CÁC PAGE:\n\
+     - Khi danh sách 'CÁC THÔNG BÁO ĐÃ GỬI GẦN ĐÂY' được cung cấp, hãy đối chiếu xem bài viết mới có đang quảng bá CÙNG MỘT hoạt động, cuộc thi, minigame hay đợt tuyển dụng đã thông báo ở một trong các campaign đó hay không.\n\
+     - BẮT BUỘC chọn decision = 'skip' và gán 'duplicate_of_campaign_id' bằng mã campaign trùng nếu bài mới trùng sự kiện đã gửi (dù khác fanpage đăng, viết lại lời dẫn hay dùng link rút gọn khác) VÀ không có thông tin mới quan trọng; đồng thời nêu rõ trong 'reason' là trùng với campaign nào.\n\
+     - KHÔNG coi là trùng (đặt 'duplicate_of_campaign_id' = null và xét gửi bình thường) nếu bài mới có cập nhật mới đáng kể: dời lịch, đổi địa điểm, gia hạn hạn chót, mở đợt hoặc vòng tiếp theo, công bố kết quả, hoặc là tập/phần mới trong một chuỗi sự kiện (Series, Kỳ 2, Minigame 02)."
 }
 
 fn format_relative_post_age(published_at: &str, now: DateTime<FixedOffset>) -> String {
@@ -292,6 +350,7 @@ fn format_relative_post_age(published_at: &str, now: DateTime<FixedOffset>) -> S
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_user_prompt(
     source_name: &str,
     post_text: &str,
@@ -299,6 +358,26 @@ fn build_user_prompt(
     published_at: &str,
     now: DateTime<FixedOffset>,
     learning_examples: &[AiLearningExample],
+) -> String {
+    build_user_prompt_with_duplicates(
+        source_name,
+        post_text,
+        post_url,
+        published_at,
+        now,
+        learning_examples,
+        &[],
+    )
+}
+
+fn build_user_prompt_with_duplicates(
+    source_name: &str,
+    post_text: &str,
+    post_url: &str,
+    published_at: &str,
+    now: DateTime<FixedOffset>,
+    learning_examples: &[AiLearningExample],
+    duplicate_candidates: &[DuplicateCampaignContext],
 ) -> String {
     let mut prompt = String::new();
     if !learning_examples.is_empty() {
@@ -319,8 +398,36 @@ fn build_user_prompt(
         prompt.push_str("---\n\n");
     }
 
+    if !duplicate_candidates.is_empty() {
+        prompt.push_str("CÁC THÔNG BÁO ĐÃ GỬI GẦN ĐÂY CÓ DẤU HIỆU LIÊN QUAN / NGHI TRÙNG:\n\n");
+        let vn_offset = now.timezone();
+        for candidate in duplicate_candidates {
+            let sent_vn = candidate.sent_at.with_timezone(&vn_offset);
+            let links_line = if candidate.shared_links.is_empty() {
+                String::new()
+            } else {
+                format!("\n  Link trùng: {}", candidate.shared_links.join(", "))
+            };
+            prompt.push_str(&format!(
+                "- Campaign #{} | Nguồn: {} | Đã gửi lúc: {}{}\n  Nội dung tóm tắt: {}\n\n",
+                candidate.campaign_id,
+                candidate.source_name,
+                sent_vn.format("%H:%M ngày %d/%m/%Y"),
+                links_line,
+                shorten_text(&candidate.text_excerpt, 320),
+            ));
+        }
+        prompt.push_str("---\n\n");
+    }
+
     let current_time_str = now.format("%H:%M ngày %d/%m/%Y (Giờ Việt Nam)").to_string();
     let published_str = format_relative_post_age(published_at, now);
+
+    let duplicate_rule = if duplicate_candidates.is_empty() {
+        ""
+    } else {
+        "\n         4. Đối chiếu với 'CÁC THÔNG BÁO ĐÃ GỬI GẦN ĐÂY': Chỉ bỏ qua (decision = 'skip', ghi rõ duplicate_of_campaign_id) nếu đây là cùng một sự kiện đã thông báo mà không có cập nhật mới; nếu là dời lịch, gia hạn, kết quả hay phần mới trong chuỗi sự kiện thì không coi là trùng."
+    };
 
     prompt.push_str(&format!(
         "THỜI ĐIỂM HIỆN TẠI: {}\n\
@@ -332,12 +439,14 @@ fn build_user_prompt(
          {}\n\n\
          LƯU Ý BẮT BUỘC:\n\
          1. Trường 'reason' BẮT BUỘC phải viết bằng TIẾNG VIỆT CHUẨN CÓ DẤU đầy đủ, không viết tắt, không dùng tiếng Việt không dấu.\n\
-         2. Đối chiếu kỹ thời điểm hiện tại và thời gian đăng bài: Nếu bài đã đăng quá cũ (từ 3 ngày trước trở lên) hoặc hạn chót/thời gian diễn ra sự kiện đã qua trong quá khứ so với thời điểm hiện tại, bắt buộc chọn decision = 'skip'.",
+         2. Đối chiếu kỹ thời điểm hiện tại và thời gian đăng bài: Nếu bài đã đăng quá cũ (từ 3 ngày trước trở lên) hoặc hạn chót/thời gian diễn ra sự kiện đã qua trong quá khứ so với thời điểm hiện tại, bắt buộc chọn decision = 'skip'.\n\
+         3. Xác định sinh viên UTH có thuộc đối tượng được tham gia theo nội dung hay không. Sinh viên các trường trên địa bàn TP.HCM bao gồm UTH; không từ chối chỉ vì tên trường hoặc khoa tổ chức khác UTH. Khi xét đối tượng, lý do phải căn cứ điều kiện tham gia thay vì chỉ tên đơn vị tổ chức.{}",
         current_time_str,
         published_str,
         source_name,
         post_url,
-        post_text.trim()
+        post_text.trim(),
+        duplicate_rule
     ));
 
     prompt
@@ -360,6 +469,7 @@ fn shorten_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
@@ -505,6 +615,65 @@ mod tests {
         assert_eq!(parsed.confidence, Some(0.95));
     }
 
+    #[tokio::test]
+    #[ignore = "requires Gemini free-tier API credentials"]
+    async fn reviewer_evaluates_external_student_eligibility() {
+        let mut reviewer = GeminiReviewerClient::new(
+            std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY is required"),
+            std::env::var("GEMINI_FALLBACK_API_KEY").ok(),
+            std::env::var("GEMINI_MODEL").expect("GEMINI_MODEL is required"),
+            Url::parse("https://generativelanguage.googleapis.com").unwrap(),
+        );
+        reviewer.client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-06T10:00:00+07:00").unwrap();
+        let cases = [
+            (
+                "open_city_minigame",
+                "[MINIGAME] GIẢI MÃ NGÀNH HỌC. Đoàn Khoa Địa lý - Đô thị, Trường ĐH KHXH&NV, ĐHQG-HCM tổ chức thử thách học thuật gồm 10 câu hỏi. Đối tượng tham gia: Sinh viên Trường ĐH KHXH&NV, ĐHQG-HCM và Sinh viên đang học tập tại các trường trên địa bàn TP.HCM. Thời gian diễn ra: Từ ngày 05/10/2026 đến ngày 10/10/2026. Trả lời câu hỏi trên bài viết để tham gia. Sinh viên tham gia hợp lệ sẽ được ghi nhận minh chứng tham gia theo quy định của chương trình.",
+                GeminiReviewDecision::Send,
+            ),
+            (
+                "open_national_contest",
+                "Cuộc thi học thuật về đô thị do Đoàn Khoa Địa lý - Đô thị, Trường ĐH KHXH&NV tổ chức. Đối tượng: sinh viên các trường đại học, cao đẳng trên toàn quốc. Đăng ký miễn phí qua biểu mẫu đến 10/10/2026, thi trực tuyến ngày 12/10/2026. Có giải thưởng và giấy chứng nhận tham gia.",
+                GeminiReviewDecision::Send,
+            ),
+            (
+                "exclusive_external_university",
+                "Minigame học thuật do Trường ĐH KHXH&NV tổ chức. Đối tượng tham gia: CHỈ sinh viên Trường ĐH KHXH&NV, ĐHQG-HCM. Không nhận sinh viên trường khác. Diễn ra từ 05/10/2026 đến 10/10/2026; tham gia trực tuyến, có giấy chứng nhận.",
+                GeminiReviewDecision::Skip,
+            ),
+            (
+                "city_location_is_not_eligibility",
+                "Cuộc thi học thuật do Trường ĐH KHXH&NV tổ chức tại Thành phố Hồ Chí Minh ngày 10/10/2026. Chỉ dành cho sinh viên Khoa Địa lý - Đô thị của trường, phải xác minh mã sinh viên của khoa. Sinh viên trường khác không được tham gia. Có điểm rèn luyện cho sinh viên của khoa.",
+                GeminiReviewDecision::Skip,
+            ),
+            (
+                "open_but_expired",
+                "Minigame học thuật do Đoàn Khoa Địa lý - Đô thị tổ chức cho sinh viên các trường trên địa bàn TP.HCM. Chương trình đã kết thúc lúc 20:00 ngày 05/10/2026. Cảm ơn các bạn đã tham gia; không còn nhận đáp án.",
+                GeminiReviewDecision::Skip,
+            ),
+        ];
+
+        for (name, text, expected) in cases {
+            let output = reviewer
+                .review_post(
+                    "Tuổi trẻ Địa lý - Đô thị",
+                    text,
+                    "https://example.com/academic-activity",
+                    "2026-10-05T20:00:00+07:00",
+                    Some(now),
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            println!("{name}: {:?}: {}", output.decision, output.reason);
+            assert_eq!(output.decision, expected, "{name}: {}", output.reason);
+        }
+    }
+
     #[test]
     fn reviewer_orders_and_normalizes_distinct_api_keys() {
         let reviewer = GeminiReviewerClient::new(
@@ -597,6 +766,94 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             vec!["primary-key", "fallback-key"]
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn prompt_includes_duplicate_candidates_only_when_non_empty() {
+        let now = test_vn_now();
+        let without_dups = build_user_prompt(
+            "CLB A",
+            "Cuộc thi mới",
+            "https://facebook.com/1",
+            "2026-09-05T08:00:00+07:00",
+            now,
+            &[],
+        );
+        assert!(!without_dups.contains("NGHI TRÙNG"));
+
+        let candidate = DuplicateCampaignContext {
+            campaign_id: 459,
+            source_name: "Tuổi trẻ CTXH".to_owned(),
+            sent_at: Utc.with_ymd_and_hms(2026, 9, 4, 13, 0, 0).unwrap(),
+            shared_links: vec!["https://forms.gle/dup".to_owned()],
+            text_excerpt: "Minigame chào mừng ngày lễ mở cho sinh viên".to_owned(),
+        };
+        let with_dups = build_user_prompt_with_duplicates(
+            "CLB B",
+            "Minigame chào mừng ngày lễ mở cho sinh viên",
+            "https://facebook.com/2",
+            "2026-09-05T08:00:00+07:00",
+            now,
+            &[],
+            &[candidate],
+        );
+        assert!(with_dups.contains("CÁC THÔNG BÁO ĐÃ GỬI GẦN ĐÂY"));
+        assert!(with_dups.contains("Campaign #459"));
+        assert!(with_dups.contains("Tuổi trẻ CTXH"));
+        assert!(with_dups.contains("https://forms.gle/dup"));
+        assert!(with_dups.contains("dời lịch"));
+    }
+
+    #[test]
+    fn system_instruction_distinguishes_duplicate_reposts_from_updates() {
+        let instruction = system_instruction();
+        assert!(instruction.contains("TRÙNG BÀI"));
+        assert!(instruction.contains("dời lịch"));
+        assert!(instruction.contains("gia hạn"));
+    }
+
+    #[tokio::test]
+    async fn reviewer_ignores_hallucinated_duplicate_campaign_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                r#"{"candidates":[{"content":{"parts":[{"text":"{\"decision\":\"skip\",\"reason\":\"Trùng lặp\",\"confidence\":0.92,\"duplicate_of_campaign_id\":9999}"}]}}]}"#,
+            );
+        });
+        let reviewer = GeminiReviewerClient::new(
+            "primary-key".to_owned(),
+            None,
+            "test-model".to_owned(),
+            Url::parse(&format!("http://{address}")).unwrap(),
+        );
+        let candidate = DuplicateCampaignContext {
+            campaign_id: 459,
+            source_name: "Tuổi trẻ CTXH".to_owned(),
+            sent_at: Utc.with_ymd_and_hms(2026, 9, 4, 13, 0, 0).unwrap(),
+            shared_links: Vec::new(),
+            text_excerpt: "Minigame".to_owned(),
+        };
+
+        let output = reviewer
+            .review_post_with_duplicates(
+                "CLB B",
+                "Minigame",
+                "https://example.com/post",
+                "2026-09-05T09:00:00+07:00",
+                Some(test_vn_now()),
+                &[],
+                &[candidate],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.duplicate_of_campaign_id, None);
         server.join().unwrap();
     }
 }

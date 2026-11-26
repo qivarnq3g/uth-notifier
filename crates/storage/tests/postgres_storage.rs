@@ -1838,3 +1838,135 @@ async fn ai_learning_examples_and_manual_review_override() {
     assert!(override_err.is_err());
     assert!(!ManualReviewOverrideOutcome::default().overridden);
 }
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
+async fn recent_facebook_campaigns_excludes_target_post_and_portal_notices() {
+    let database_url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL is required");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let store = CrawlStore::connect(&database_url, 2).await.unwrap();
+    store.migrate().await.unwrap();
+    sqlx::query(
+        "TRUNCATE deliveries, digest_items, campaigns, manual_review_resolutions, classifications, outbox_events, post_revisions, posts, portal_notices, crawler_runs, sources, subscribers RESTART IDENTITY CASCADE",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    store
+        .upsert_sources(&[
+            SourceSeed {
+                key: "source-a".to_owned(),
+                name: "Đoàn Trường UTH".to_owned(),
+                url: "https://www.facebook.com/source.a".to_owned(),
+                schedule_interval_seconds: 300,
+            },
+            SourceSeed {
+                key: "source-b".to_owned(),
+                name: "CLB Truyền Thông".to_owned(),
+                url: "https://www.facebook.com/source.b".to_owned(),
+                schedule_interval_seconds: 300,
+            },
+        ])
+        .await
+        .unwrap();
+
+    let source_a_id: i64 =
+        sqlx::query_scalar("SELECT id FROM sources WHERE source_key = 'source-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let source_b_id: i64 =
+        sqlx::query_scalar("SELECT id FROM sources WHERE source_key = 'source-b'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let post_a_id: i64 = sqlx::query_scalar(
+        "INSERT INTO posts (source_id, external_post_id, current_content_hash, canonical_url, published_at, text, media, outbound_links, crawl_strategy, first_seen_at, last_seen_at) \
+         VALUES ($1, 'post-a', 'sha256:a', 'https://www.facebook.com/source.a/posts/1', CURRENT_TIMESTAMP - INTERVAL '1 day', \
+                 'Cuộc thi học thuật 2026 mở đăng ký cho sinh viên TP.HCM', '[]'::jsonb, '[\"https://forms.gle/shared123\"]'::jsonb, 'browser', CURRENT_TIMESTAMP - INTERVAL '1 day', CURRENT_TIMESTAMP) \
+         RETURNING id",
+    )
+    .bind(source_a_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let post_b_id: i64 = sqlx::query_scalar(
+        "INSERT INTO posts (source_id, external_post_id, current_content_hash, canonical_url, published_at, text, media, outbound_links, crawl_strategy, first_seen_at, last_seen_at) \
+         VALUES ($1, 'post-b', 'sha256:b', 'https://www.facebook.com/source.b/posts/2', CURRENT_TIMESTAMP - INTERVAL '2 hours', \
+                 'Cuộc thi học thuật 2026 mở đăng ký cho sinh viên TP.HCM', '[]'::jsonb, '[\"https://forms.gle/shared123\"]'::jsonb, 'browser', CURRENT_TIMESTAMP - INTERVAL '2 hours', CURRENT_TIMESTAMP) \
+         RETURNING id",
+    )
+    .bind(source_b_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let class_a_id: i64 = sqlx::query_scalar(
+        "INSERT INTO classifications \
+         (post_id, schema_version, input_content_hash, decision, score, confidence_basis_points, matched_rules, classifier_version, config_hash, classified_at) \
+         VALUES ($1, 'classification.v1', 'sha256:a', 'matched_explicit', 9, 9500, '[]'::jsonb, 'test', 'sha256:cfg', CURRENT_TIMESTAMP) \
+         RETURNING id",
+    )
+    .bind(post_a_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let campaign_a_id: i64 = sqlx::query_scalar(
+        "INSERT INTO campaigns (classification_id, post_id, message_text, post_url, action_url, explicit_drl) \
+         VALUES ($1, $2, 'Cuộc thi học thuật 2026', 'https://www.facebook.com/source.a/posts/1', 'https://forms.gle/shared123', TRUE) \
+         RETURNING id",
+    )
+    .bind(class_a_id)
+    .bind(post_a_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let portal_id: i64 = 999;
+    sqlx::query(
+        "INSERT INTO portal_notices (portal_id, title, displayed_at) VALUES ($1, 'Thông báo đào tạo', CURRENT_TIMESTAMP)",
+    )
+    .bind(portal_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO campaigns (portal_notice_id, message_text, post_url, explicit_drl) \
+         VALUES ($1, 'Thông báo đào tạo', 'https://portal.ut.edu.vn/notice/999', FALSE)",
+    )
+    .bind(portal_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let candidates = store
+        .recent_facebook_campaigns(post_b_id, 14, 50)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].campaign_id, campaign_a_id);
+    assert_eq!(candidates[0].post_id, post_a_id);
+    assert_eq!(candidates[0].source_id, source_a_id);
+    assert_eq!(candidates[0].source_name, "Đoàn Trường UTH");
+    assert_eq!(
+        candidates[0].action_url.as_deref(),
+        Some("https://forms.gle/shared123")
+    );
+    assert_eq!(
+        candidates[0].outbound_links,
+        vec!["https://forms.gle/shared123".to_owned()]
+    );
+
+    let excluded_self = store
+        .recent_facebook_campaigns(post_a_id, 14, 50)
+        .await
+        .unwrap();
+    assert!(excluded_self.is_empty());
+}

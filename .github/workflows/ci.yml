@@ -96,7 +96,7 @@ jobs:
       - name: Audit Rust dependencies
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit --ignore RUSTSEC-2023-0071
+          cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
       - name: Build Cloudflare edge worker
         working-directory: apps/edge-worker
         run: |

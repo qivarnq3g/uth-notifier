@@ -1887,9 +1887,9 @@ async fn recent_facebook_campaigns_excludes_target_post_and_portal_notices() {
             .unwrap();
 
     let post_a_id: i64 = sqlx::query_scalar(
-        "INSERT INTO posts (source_id, external_post_id, current_content_hash, canonical_url, published_at, text, outbound_links) \
+        "INSERT INTO posts (source_id, external_post_id, current_content_hash, canonical_url, published_at, text, media, outbound_links, crawl_strategy, first_seen_at, last_seen_at) \
          VALUES ($1, 'post-a', 'sha256:a', 'https://www.facebook.com/source.a/posts/1', CURRENT_TIMESTAMP - INTERVAL '1 day', \
-                 'Cuộc thi học thuật 2026 mở đăng ký cho sinh viên TP.HCM', '[\"https://forms.gle/shared123\"]'::jsonb) \
+                 'Cuộc thi học thuật 2026 mở đăng ký cho sinh viên TP.HCM', '[]'::jsonb, '[\"https://forms.gle/shared123\"]'::jsonb, 'browser', CURRENT_TIMESTAMP - INTERVAL '1 day', CURRENT_TIMESTAMP) \
          RETURNING id",
     )
     .bind(source_a_id)
@@ -1897,9 +1897,9 @@ async fn recent_facebook_campaigns_excludes_target_post_and_portal_notices() {
     .await
     .unwrap();
     let post_b_id: i64 = sqlx::query_scalar(
-        "INSERT INTO posts (source_id, external_post_id, current_content_hash, canonical_url, published_at, text, outbound_links) \
+        "INSERT INTO posts (source_id, external_post_id, current_content_hash, canonical_url, published_at, text, media, outbound_links, crawl_strategy, first_seen_at, last_seen_at) \
          VALUES ($1, 'post-b', 'sha256:b', 'https://www.facebook.com/source.b/posts/2', CURRENT_TIMESTAMP - INTERVAL '2 hours', \
-                 'Cuộc thi học thuật 2026 mở đăng ký cho sinh viên TP.HCM', '[\"https://forms.gle/shared123\"]'::jsonb) \
+                 'Cuộc thi học thuật 2026 mở đăng ký cho sinh viên TP.HCM', '[]'::jsonb, '[\"https://forms.gle/shared123\"]'::jsonb, 'browser', CURRENT_TIMESTAMP - INTERVAL '2 hours', CURRENT_TIMESTAMP) \
          RETURNING id",
     )
     .bind(source_b_id)

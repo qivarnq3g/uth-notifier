@@ -19,6 +19,7 @@ pinned=0
 evicted=0
 unrecovered=0
 errors=0
+declare -A seen_paths=()
 
 json_string() {
   local value=$1
@@ -50,6 +51,10 @@ pinned_digest() {
 
 guard_file() {
   local path=$1 key expected observed after disk
+  if [ -n "${seen_paths[$path]:-}" ]; then
+    return
+  fi
+  seen_paths[$path]=1
   key=$(stat -L -c '%d:%i:%s:%Y' "$path")
   checked=$((checked + 1))
   expected=$(pinned_digest "$key")
@@ -78,13 +83,25 @@ guard_file() {
   unrecovered=$((unrecovered + 1))
 }
 
+guard_file_and_dependencies() {
+  local path=$1 dep
+  guard_file "$path"
+  if [ -x "$path" ] && command -v ldd >/dev/null 2>&1; then
+    while IFS= read -r dep; do
+      if [ -n "$dep" ] && [ -f "$dep" ]; then
+        guard_file "$dep"
+      fi
+    done < <(ldd "$path" 2>/dev/null | awk '/=> \// { print $3 }' | sort -u)
+  fi
+}
+
 for target in "$@"; do
   if [ -d "$target" ]; then
     while IFS= read -r -d '' path; do
-      guard_file "$path"
+      guard_file_and_dependencies "$path"
     done < <(find "$target" -type f -print0 | sort -z)
   elif [ -f "$target" ]; then
-    guard_file "$target"
+    guard_file_and_dependencies "$target"
   else
     emit target_missing "$target" "" ""
     errors=$((errors + 1))

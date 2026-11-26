@@ -23,7 +23,10 @@ use uth_storage::{
     UserFeedbackHistoryRecord,
 };
 
-use crate::gemini_reviewer::{GeminiReviewDecision, GeminiReviewerClient};
+use crate::duplicate_filter::{
+    DuplicateAssessment, ExactDuplicateMatch, assess_cross_page_duplicates, duplicate_contexts,
+};
+use crate::gemini_reviewer::{GeminiReviewDecision, GeminiReviewOutput, GeminiReviewerClient};
 use crate::payos::PayOsClient;
 use crate::portal::{
     PortalAttachment, PortalClient, PortalFailureKind, PortalNotice, TELEGRAM_DOCUMENT_LIMIT,
@@ -34,6 +37,8 @@ const DONATION_AMOUNT_INPUT_TTL_SECONDS: i64 = 600;
 const USER_FEEDBACK_INPUT_TTL_SECONDS: i64 = 600;
 const TELEGRAM_WORKER_LEASE_KEY: &str = "telegram_delivery";
 const PORTAL_HISTORY_BACKFILL_SIZE: usize = 20;
+const CROSS_PAGE_DEDUP_WINDOW_DAYS: i64 = 14;
+const CROSS_PAGE_DEDUP_CAMPAIGN_LIMIT: i64 = 150;
 
 #[cfg(unix)]
 struct ShutdownSignals {
@@ -1148,6 +1153,15 @@ async fn run_portal_cycle(
                     return Err(error);
                 }
             };
+            if let Some(attachment_url) = notice.attachment_url.as_deref() {
+                let content_type = notice
+                    .attachment_content_type
+                    .as_deref()
+                    .unwrap_or("application/pdf");
+                let _ = store
+                    .set_portal_notice_attachment(portal_id, attachment_url, content_type)
+                    .await?;
+            }
             if store
                 .set_portal_notice_body(portal_id, &notice.body)
                 .await?
@@ -2301,6 +2315,19 @@ async fn build_interaction_reply(
                 notice.attachment_url = Some(attachment_url);
                 notice.attachment_content_type = Some(content_type.to_owned());
             }
+            if notice.attachment_url.is_none()
+                && let Ok(fetched) = portal.fetch_notice(notice.portal_id).await
+                && let Some(attachment_url) = fetched.attachment_url
+            {
+                let content_type = fetched
+                    .attachment_content_type
+                    .unwrap_or_else(|| "application/pdf".to_owned());
+                store
+                    .set_portal_notice_attachment(notice.portal_id, &attachment_url, &content_type)
+                    .await?;
+                notice.attachment_url = Some(attachment_url);
+                notice.attachment_content_type = Some(content_type);
+            }
             let source_url = notice
                 .article_url
                 .clone()
@@ -2319,18 +2346,56 @@ async fn build_interaction_reply(
                 admin_text: None,
                 suggestion_created: false,
             };
-            if let Some(attachment_url) = notice.attachment_url.as_deref() {
+            if let Some(attachment_url) = notice.attachment_url.clone() {
                 match portal
                     .download_attachment(
                         notice.portal_id,
-                        attachment_url,
+                        &attachment_url,
                         notice.attachment_content_type.as_deref(),
                     )
                     .await
                 {
                     Ok(attachment) => reply.portal_document = Some(PortalDocumentReply { attachment }),
                     Err(error) => {
-                        reply.user_text = portal_attachment_error_message(&reply.user_text, &error.to_string());
+                        if let Ok(fetched) = portal.fetch_notice(notice.portal_id).await
+                            && let Some(refreshed_url) = fetched.attachment_url
+                            && refreshed_url != attachment_url
+                        {
+                            let content_type = fetched
+                                .attachment_content_type
+                                .unwrap_or_else(|| "application/pdf".to_owned());
+                            store
+                                .set_portal_notice_attachment(
+                                    notice.portal_id,
+                                    &refreshed_url,
+                                    &content_type,
+                                )
+                                .await?;
+                            if reply.portal_source_url.as_deref() == Some(attachment_url.as_str()) {
+                                reply.portal_source_url = Some(refreshed_url.clone());
+                            }
+                            match portal
+                                .download_attachment(
+                                    notice.portal_id,
+                                    &refreshed_url,
+                                    Some(&content_type),
+                                )
+                                .await
+                            {
+                                Ok(attachment) => {
+                                    reply.portal_document = Some(PortalDocumentReply { attachment });
+                                }
+                                Err(refresh_error) => {
+                                    reply.user_text = portal_attachment_error_message(
+                                        &reply.user_text,
+                                        &refresh_error.to_string(),
+                                    );
+                                }
+                            }
+                        } else {
+                            reply.user_text =
+                                portal_attachment_error_message(&reply.user_text, &error.to_string());
+                        }
                     }
                 }
             }
@@ -4112,6 +4177,109 @@ async fn plan_event(
     }
 }
 
+async fn load_duplicate_assessment(
+    store: &CrawlStore,
+    database_post_id: i64,
+    text: &str,
+    outbound_links: &[String],
+    action_url: Option<&str>,
+) -> Result<DuplicateAssessment> {
+    let recent_campaigns = store
+        .recent_facebook_campaigns(
+            database_post_id,
+            CROSS_PAGE_DEDUP_WINDOW_DAYS,
+            CROSS_PAGE_DEDUP_CAMPAIGN_LIMIT,
+        )
+        .await?;
+    Ok(assess_cross_page_duplicates(
+        text,
+        outbound_links,
+        action_url,
+        &recent_campaigns,
+    ))
+}
+
+fn format_auto_duplicate_reason(matched: &ExactDuplicateMatch) -> String {
+    format!(
+        "[Auto Dedup] Trùng nội dung đã thông báo từ {} (campaign #{}, tương đồng {}%)",
+        matched.source_name, matched.campaign_id, matched.similarity_percent
+    )
+}
+
+fn format_gemini_skip_reason(output: &GeminiReviewOutput) -> String {
+    match output.duplicate_of_campaign_id {
+        Some(campaign_id) => format!(
+            "[Gemini AI] Trùng với campaign #{}: {}",
+            campaign_id, output.reason
+        ),
+        None => format!("[Gemini AI] {}", output.reason),
+    }
+}
+
+struct AdminSkipPost<'a> {
+    classification_id: i64,
+    source_name: &'a str,
+    published_at: &'a str,
+    text: &'a str,
+    url: &'a str,
+}
+
+fn format_admin_skip_alert(
+    heading: &str,
+    post: &AdminSkipPost<'_>,
+    reason: &str,
+    confidence_percent: f64,
+) -> String {
+    format!(
+        "{heading} #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {reason}\nĐộ tin cậy: {confidence_percent:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
+        post.classification_id,
+        post.source_name,
+        format_vietnam_datetime(post.published_at),
+        shorten_chars(post.text, 500),
+        post.url,
+        post.classification_id,
+    )
+}
+
+async fn notify_admin_gemini_skip(
+    telegram: &TelegramClient,
+    admin_chat_id: Option<i64>,
+    post: &AdminSkipPost<'_>,
+    gemini_output: &GeminiReviewOutput,
+) {
+    let Some(admin_chat_id) = admin_chat_id else {
+        return;
+    };
+    let heading = if gemini_output.duplicate_of_campaign_id.is_some() {
+        "GEMINI AI: BÀI BỎ QUA DO TRÙNG"
+    } else {
+        "GEMINI AI: BÀI ĐÃ BỎ QUA"
+    };
+    let display_reason = match gemini_output.duplicate_of_campaign_id {
+        Some(campaign_id) => format!(
+            "Trùng với campaign #{campaign_id}: {}",
+            gemini_output.reason
+        ),
+        None => gemini_output.reason.clone(),
+    };
+    let admin_msg = format_admin_skip_alert(
+        heading,
+        post,
+        &display_reason,
+        gemini_output.confidence * 100.0,
+    );
+    let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+}
+
+fn extract_first_form_link(extracted: &serde_json::Value) -> Option<String> {
+    extracted
+        .get("form_links")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|links| links.first())
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 async fn plan_event_inner(
     store: &CrawlStore,
     telegram: &TelegramClient,
@@ -4138,28 +4306,57 @@ async fn plan_event_inner(
             let source_name = store.source_name_for_post(payload.database_post_id).await?;
             let current_post_url = delivery_post_url(&post);
             post_url = Some(current_post_url.clone());
-            action_url = payload
-                .classification
-                .extracted
-                .get("form_links")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|links| links.first())
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
+            action_url = extract_first_form_link(&payload.classification.extracted);
 
-            if let Some(gemini_client) = gemini {
+            let duplicate_assessment = load_duplicate_assessment(
+                store,
+                payload.database_post_id,
+                &post.text,
+                &post.outbound_links,
+                action_url.as_deref(),
+            )
+            .await?;
+            if let Some(exact) = &duplicate_assessment.exact_match {
+                let reason = format_auto_duplicate_reason(exact);
+                let _ = store
+                    .record_classification_review_resolution(
+                        payload.database_classification_id,
+                        admin_chat_id.unwrap_or(0),
+                        ManualReviewAction::Skip,
+                        Some(&reason),
+                    )
+                    .await;
+                if let Some(admin_chat_id) = admin_chat_id {
+                    let admin_msg = format_admin_skip_alert(
+                        "TỰ ĐỘNG BỎ QUA (TRÙNG BÀI)",
+                        &AdminSkipPost {
+                            classification_id: payload.database_classification_id,
+                            source_name: &source_name,
+                            published_at: &post.published_at,
+                            text: &post.text,
+                            url: &current_post_url,
+                        },
+                        &reason,
+                        f64::from(exact.similarity_percent),
+                    );
+                    let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                }
+                None
+            } else if let Some(gemini_client) = gemini {
                 let examples = store
                     .latest_ai_learning_examples(5)
                     .await
                     .unwrap_or_default();
+                let duplicate_context = duplicate_contexts(&duplicate_assessment);
                 match gemini_client
-                    .review_post(
+                    .review_post_with_duplicates(
                         &source_name,
                         &post.text,
                         &current_post_url,
                         &post.published_at,
                         None,
                         &examples,
+                        &duplicate_context,
                     )
                     .await
                 {
@@ -4190,32 +4387,38 @@ async fn plan_event_inner(
                             Some(render_notification(&post))
                         }
                         GeminiReviewDecision::Skip => {
-                            if let Some(admin_chat_id) = admin_chat_id {
-                                let _ = store
-                                    .record_classification_review_resolution(
-                                        payload.database_classification_id,
-                                        admin_chat_id,
-                                        ManualReviewAction::Skip,
-                                        Some(&format!("[Gemini AI] {}", gemini_output.reason)),
-                                    )
-                                    .await;
-                                let admin_msg = format!(
-                                    "GEMINI AI: BÀI ĐÃ BỎ QUA #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
+                            let stored_reason = format_gemini_skip_reason(&gemini_output);
+                            let _ = store
+                                .record_classification_review_resolution(
                                     payload.database_classification_id,
-                                    source_name,
-                                    format_vietnam_datetime(&post.published_at),
-                                    gemini_output.reason,
-                                    gemini_output.confidence * 100.0,
-                                    shorten_chars(&post.text, 500),
-                                    current_post_url,
-                                    payload.database_classification_id
-                                );
-                                let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
-                            }
+                                    admin_chat_id.unwrap_or(0),
+                                    ManualReviewAction::Skip,
+                                    Some(&stored_reason),
+                                )
+                                .await;
+                            notify_admin_gemini_skip(
+                                telegram,
+                                admin_chat_id,
+                                &AdminSkipPost {
+                                    classification_id: payload.database_classification_id,
+                                    source_name: &source_name,
+                                    published_at: &post.published_at,
+                                    text: &post.text,
+                                    url: &current_post_url,
+                                },
+                                &gemini_output,
+                            )
+                            .await;
                             None
                         }
                     },
                     Err(err) => {
+                        if duplicate_assessment.defer_on_ai_error {
+                            return Err(AiReviewUnavailable(format!(
+                                "Gemini duplicate review deferred: {err:#}"
+                            ))
+                            .into());
+                        }
                         eprintln!(
                             "Gemini review error for matched_explicit, fallback to auto-send: {err:#}"
                         );
@@ -4239,50 +4442,94 @@ async fn plan_event_inner(
                 let now = Utc::now();
                 let expired = automatic_review_action(&review.post.published_at, now, None)?
                     == AutomaticReviewAction::Skip;
-                let gemini_output = if expired {
-                    None
-                } else {
-                    let gemini_client = gemini.ok_or_else(|| {
-                        AiReviewUnavailable(
-                            "Gemini is not configured; automatic review deferred".to_owned(),
+                if expired {
+                    let _ = store
+                        .resolve_ai_review(
+                            payload.database_classification_id,
+                            ManualReviewAction::Skip,
+                            "[Auto] Bài đã đăng từ 3 ngày trở lên",
+                            None,
                         )
-                    })?;
-                    let examples = store
-                        .latest_ai_learning_examples(5)
-                        .await
-                        .unwrap_or_default();
-                    Some(
-                        gemini_client
-                            .review_post(
-                                &review.source_name,
-                                &review.post.text,
-                                &review_url,
-                                &review.post.published_at,
-                                None,
-                                &examples,
-                            )
-                            .await
-                            .map_err(|error| {
-                                AiReviewUnavailable(format!("Gemini review deferred: {error:#}"))
-                            })?,
+                        .await?;
+                    return plan_empty_notification(store, event, owner, &payload).await;
+                }
+
+                let review_action_url = extract_first_form_link(&payload.classification.extracted);
+                let duplicate_assessment = load_duplicate_assessment(
+                    store,
+                    payload.database_post_id,
+                    &review.post.text,
+                    &review.post.outbound_links,
+                    review_action_url.as_deref(),
+                )
+                .await?;
+                if let Some(exact) = &duplicate_assessment.exact_match {
+                    let reason = format_auto_duplicate_reason(exact);
+                    let outcome = store
+                        .resolve_ai_review(
+                            payload.database_classification_id,
+                            ManualReviewAction::Skip,
+                            &reason,
+                            None,
+                        )
+                        .await?;
+                    if outcome.resolved
+                        && let Some(admin_chat_id) = admin_chat_id
+                    {
+                        let admin_msg = format_admin_skip_alert(
+                            "TỰ ĐỘNG BỎ QUA (TRÙNG BÀI)",
+                            &AdminSkipPost {
+                                classification_id: payload.database_classification_id,
+                                source_name: &review.source_name,
+                                published_at: &review.post.published_at,
+                                text: &review.post.text,
+                                url: &review_url,
+                            },
+                            &reason,
+                            f64::from(exact.similarity_percent),
+                        );
+                        let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                    }
+                    return plan_empty_notification(store, event, owner, &payload).await;
+                }
+
+                let gemini_client = gemini.ok_or_else(|| {
+                    AiReviewUnavailable(
+                        "Gemini is not configured; automatic review deferred".to_owned(),
                     )
-                };
+                })?;
+                let examples = store
+                    .latest_ai_learning_examples(5)
+                    .await
+                    .unwrap_or_default();
+                let duplicate_context = duplicate_contexts(&duplicate_assessment);
+                let gemini_output = gemini_client
+                    .review_post_with_duplicates(
+                        &review.source_name,
+                        &review.post.text,
+                        &review_url,
+                        &review.post.published_at,
+                        None,
+                        &examples,
+                        &duplicate_context,
+                    )
+                    .await
+                    .map_err(|error| {
+                        AiReviewUnavailable(format!("Gemini review deferred: {error:#}"))
+                    })?;
                 let action = automatic_review_action(
                     &review.post.published_at,
                     Utc::now(),
-                    gemini_output.as_ref().map(|output| output.decision),
+                    Some(gemini_output.decision),
                 )?;
                 match action {
                     AutomaticReviewAction::Send => {
-                        let output = gemini_output
-                            .as_ref()
-                            .context("missing Gemini send decision")?;
                         let notification = render_notification(&review.post);
                         let outcome = store
                             .resolve_ai_review(
                                 payload.database_classification_id,
                                 ManualReviewAction::Send,
-                                &format!("[Gemini AI] {}", output.reason),
+                                &format!("[Gemini AI] {}", gemini_output.reason),
                                 Some(ManualReviewNotification {
                                     message_text: &notification,
                                     post_url: &review_url,
@@ -4297,8 +4544,8 @@ async fn plan_event_inner(
                                 payload.database_classification_id,
                                 review.source_name,
                                 format_vietnam_datetime(&review.post.published_at),
-                                output.reason,
-                                output.confidence * 100.0,
+                                gemini_output.reason,
+                                gemini_output.confidence * 100.0,
                                 shorten_chars(&review.post.text, 500),
                                 review_url,
                                 payload.database_classification_id
@@ -4307,36 +4554,29 @@ async fn plan_event_inner(
                         }
                     }
                     AutomaticReviewAction::Skip => {
-                        let ai_skip = gemini_output
-                            .as_ref()
-                            .filter(|output| output.decision == GeminiReviewDecision::Skip);
-                        let reason = ai_skip
-                            .map(|output| format!("[Gemini AI] {}", output.reason))
-                            .unwrap_or_else(|| "[Auto] Bài đã đăng từ 3 ngày trở lên".to_owned());
+                        let stored_reason = format_gemini_skip_reason(&gemini_output);
                         let outcome = store
                             .resolve_ai_review(
                                 payload.database_classification_id,
                                 ManualReviewAction::Skip,
-                                &reason,
+                                &stored_reason,
                                 None,
                             )
                             .await?;
-                        if outcome.resolved
-                            && let Some(output) = ai_skip
-                            && let Some(admin_chat_id) = admin_chat_id
-                        {
-                            let admin_msg = format!(
-                                "GEMINI AI: BÀI ĐÃ BỎ QUA #{}\nNguồn: {}\nĐăng lúc: {}\nLý do AI: {}\nĐộ tin cậy: {:.0}%\n\n{}\n\nBài gốc: {}\n\nNếu muốn duyệt bài này, bấm: /ai_approve_{}",
-                                payload.database_classification_id,
-                                review.source_name,
-                                format_vietnam_datetime(&review.post.published_at),
-                                output.reason,
-                                output.confidence * 100.0,
-                                shorten_chars(&review.post.text, 500),
-                                review_url,
-                                payload.database_classification_id
-                            );
-                            let _ = telegram.send_message(admin_chat_id, &admin_msg).await;
+                        if outcome.resolved {
+                            notify_admin_gemini_skip(
+                                telegram,
+                                admin_chat_id,
+                                &AdminSkipPost {
+                                    classification_id: payload.database_classification_id,
+                                    source_name: &review.source_name,
+                                    published_at: &review.post.published_at,
+                                    text: &review.post.text,
+                                    url: &review_url,
+                                },
+                                &gemini_output,
+                            )
+                            .await;
                         }
                     }
                     AutomaticReviewAction::Retry => {
@@ -4361,6 +4601,23 @@ async fn plan_event_inner(
             payload.database_classification_id,
             payload.database_post_id,
             content.as_ref(),
+        )
+        .await
+}
+
+async fn plan_empty_notification(
+    store: &CrawlStore,
+    event: &ClaimedNotificationEvent,
+    owner: &str,
+    payload: &NotificationEventPayload,
+) -> Result<NotificationPlanOutcome> {
+    store
+        .plan_notification(
+            event,
+            owner,
+            payload.database_classification_id,
+            payload.database_post_id,
+            None,
         )
         .await
 }
@@ -4896,7 +5153,8 @@ fn render_operational_alert(kind: OperationalAlertKind, health: &OperationalHeal
 
 #[cfg(test)]
 mod tests {
-    use crate::gemini_reviewer::GeminiReviewDecision;
+    use crate::duplicate_filter::ExactDuplicateMatch;
+    use crate::gemini_reviewer::{GeminiReviewDecision, GeminiReviewOutput};
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use uth_storage::{
         ActiveEventRecord, CrawlAttemptHistoryRecord, CrawlHistoryDetail, CrawlHistoryRecord,
@@ -4905,10 +5163,11 @@ mod tests {
     };
 
     use super::{
-        AutomaticReviewAction, DonationConfig, InteractionCommand, PayOsSettings,
+        AdminSkipPost, AutomaticReviewAction, DonationConfig, InteractionCommand, PayOsSettings,
         PortalCycleReport, PortalPollConfig, SUPPORT_GROUP_INVITATION, automatic_review_action,
-        display_bank, next_portal_poll_state, normalize_facebook_page_url, parse_donation_amount,
-        parse_interaction_command, payos_client, render_active_events_page,
+        display_bank, format_admin_skip_alert, format_auto_duplicate_reason,
+        format_gemini_skip_reason, next_portal_poll_state, normalize_facebook_page_url,
+        parse_donation_amount, parse_interaction_command, payos_client, render_active_events_page,
         render_crawl_history_detail, render_crawl_history_page, render_donation, render_help,
         render_operational_alert, render_operational_health, render_payment_account,
         render_portal_notice_history_detail, render_portal_notice_history_page, render_source_page,
@@ -5777,5 +6036,42 @@ mod tests {
         assert!(md.contains("Tổng bài viết Facebook đã thu thập: 1500"));
         assert!(md.contains("Mẫu học tập phản hồi AI (ai_review_learning_examples): 7"));
         assert!(md.contains("Tổng số tiền ủng hộ (7 ngày qua): 150.000 VND"));
+    }
+
+    #[test]
+    fn formats_duplicate_skip_reasons_and_admin_override_alert() {
+        let exact = ExactDuplicateMatch {
+            campaign_id: 459,
+            source_name: "Tuổi trẻ CTXH".to_owned(),
+            similarity_percent: 98,
+        };
+        let auto_reason = format_auto_duplicate_reason(&exact);
+        assert!(auto_reason.contains("[Auto Dedup]"));
+        assert!(auto_reason.contains("campaign #459"));
+        assert!(auto_reason.contains("98%"));
+
+        let ai_dup = GeminiReviewOutput {
+            decision: GeminiReviewDecision::Skip,
+            reason: "Trùng hoạt động đã thông báo".to_owned(),
+            confidence: 0.94,
+            duplicate_of_campaign_id: Some(459),
+        };
+        let ai_reason = format_gemini_skip_reason(&ai_dup);
+        assert!(ai_reason.contains("campaign #459"));
+
+        let alert = format_admin_skip_alert(
+            "GEMINI AI: BÀI BỎ QUA DO TRÙNG",
+            &AdminSkipPost {
+                classification_id: 888,
+                source_name: "CLB B",
+                published_at: "2026-11-26T08:00:00+07:00",
+                text: "Nội dung test",
+                url: "https://www.facebook.com/clbb/posts/1",
+            },
+            &ai_reason,
+            94.0,
+        );
+        assert!(alert.contains("GEMINI AI: BÀI BỎ QUA DO TRÙNG #888"));
+        assert!(alert.contains("/ai_approve_888"));
     }
 }

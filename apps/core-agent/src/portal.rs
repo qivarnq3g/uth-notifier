@@ -654,7 +654,7 @@ fn validate_api_base(url: &Url) -> Result<()> {
 }
 
 fn validate_attachment_url(raw: &str) -> Result<Url> {
-    let url = Url::parse(raw).context("Portal attachment URL is invalid")?;
+    let mut url = Url::parse(raw).context("Portal attachment URL is invalid")?;
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -663,17 +663,33 @@ fn validate_attachment_url(raw: &str) -> Result<Url> {
     {
         bail!("Portal attachment URL is outside the approved public endpoint");
     }
-    let attachment_id = url
+    let attachment_token = url
         .path()
         .strip_prefix("/api/v1/notification/getFile/")
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0);
-    let portal_file = url.host_str() == Some("portal.ut.edu.vn") && attachment_id.is_some();
+        .filter(|value| is_valid_portal_attachment_id_or_token(value));
+    let portal_file = matches!(
+        url.host_str(),
+        Some("portal.ut.edu.vn" | "portal-publicapp.ut.edu.vn")
+    ) && attachment_token.is_some();
     let daotao_pdf = is_daotao_pdf_upload_url(&url);
     if !portal_file && !daotao_pdf {
         bail!("Portal attachment URL is outside the approved public endpoint");
     }
+    if portal_file && url.host_str() == Some("portal-publicapp.ut.edu.vn") {
+        url.set_host(Some("portal.ut.edu.vn"))
+            .context("Portal attachment URL host cannot be normalized")?;
+    }
     Ok(url)
+}
+
+fn is_valid_portal_attachment_id_or_token(value: &str) -> bool {
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse::<i64>().is_ok_and(|id| id > 0);
+    }
+    (16..=256).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn validate_article_url(raw: &str) -> Result<Url> {
@@ -1084,6 +1100,29 @@ mod tests {
         assert!(requests[0].starts_with("GET /notification/321"));
     }
 
+    #[tokio::test]
+    async fn canonicalizes_portal_publicapp_token_attachment_urls() {
+        let (base_url, server) = mock_server(vec![(
+            200,
+            r#"{"success":true,"body":{"id":1457,"tieuDe":"THÔNG BÁO ĐÓNG BẢO HIỂM Y TẾ NĂM HỌC 2026 - 2027","noiDung":"","ngayHienThi":"2026-11-03T13:30:00Z","noiDungUrl":"https://portal-publicapp.ut.edu.vn/api/v1/notification/getFile/RXK49svUiPHXnYkhdoNtG2l0yd_hRolNOh5n5-jrMKo","noiDungFileType":"application/pdf"}}"#,
+        )])
+        .await;
+        let client = portal_client(&base_url);
+
+        let notice = client.fetch_notice(1457).await.unwrap();
+        assert_eq!(
+            notice.attachment_url.as_deref(),
+            Some(
+                "https://portal.ut.edu.vn/api/v1/notification/getFile/RXK49svUiPHXnYkhdoNtG2l0yd_hRolNOh5n5-jrMKo"
+            )
+        );
+        assert_eq!(
+            notice.attachment_content_type.as_deref(),
+            Some("application/pdf")
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn only_permanent_attachment_failures_skip_the_retry_budget() {
         assert!(attachment_status_is_permanent(StatusCode::NOT_FOUND));
@@ -1116,6 +1155,22 @@ mod tests {
             validate_attachment_url("https://portal.ut.edu.vn/api/v1/notification/getFile/2")
                 .is_ok()
         );
+        assert_eq!(
+            validate_attachment_url(
+                "https://portal-publicapp.ut.edu.vn/api/v1/notification/getFile/RXK49svUiPHXnYkhdoNtG2l0yd_hRolNOh5n5-jrMKo"
+            )
+            .unwrap()
+            .as_str(),
+            "https://portal.ut.edu.vn/api/v1/notification/getFile/RXK49svUiPHXnYkhdoNtG2l0yd_hRolNOh5n5-jrMKo"
+        );
+        assert_eq!(
+            validate_attachment_url(
+                "https://portal.ut.edu.vn/api/v1/notification/getFile/RXK49svUiPHXnYkhdoNtG2l0yd_hRolNOh5n5-jrMKo"
+            )
+            .unwrap()
+            .as_str(),
+            "https://portal.ut.edu.vn/api/v1/notification/getFile/RXK49svUiPHXnYkhdoNtG2l0yd_hRolNOh5n5-jrMKo"
+        );
         assert!(
             validate_attachment_url(
                 "https://portal.ut.edu.vn/api/v1/notification/getFile/2?token=value"
@@ -1128,6 +1183,18 @@ mod tests {
         assert!(
             validate_attachment_url("https://portal.ut.edu.vn/api/v1/notification/getFile/0")
                 .is_err()
+        );
+        assert!(
+            validate_attachment_url(
+                "https://portal-publicapp.ut.edu.vn/api/v1/notification/getFile/0"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_attachment_url(
+                "https://portal.ut.edu.vn/api/v1/notification/getFile/RXK49svUiPHXnYkhdoNtG2l0yd_hRolNOh5n5-jrMKo/extra"
+            )
+            .is_err()
         );
         assert!(
             validate_attachment_url(
